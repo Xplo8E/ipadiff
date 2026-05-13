@@ -1,0 +1,15 @@
+# build output
+/bin/
+
+# local diff output (the default ipadiff output dir)
+/ipa-diffs/
+
+# editor / OS junk
+.DS_Store
+*.swp
+*~
+
+# Go test/coverage artifacts
+*.test
+*.out
+coverage.txt

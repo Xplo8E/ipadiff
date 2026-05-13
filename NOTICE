@@ -1,0 +1,23 @@
+ipadiff
+========
+
+This project vendors code from blacktop/ipsw (https://github.com/blacktop/ipsw)
+under MIT license. The vendored sources live under `internal/vendored/` and
+retain their copyright headers. A copy of the upstream ipsw license is
+preserved at `internal/vendored/LICENSE.ipsw`.
+
+Upstream ipsw commit pinned at vendor time:
+  d8aec666867becf32f904a1d6338f9e23efd55c1
+
+Vendored package map:
+  internal/vendored/ipsw_macho/        <- ipsw internal/commands/macho/
+  internal/vendored/ipsw_ent/          <- ipsw internal/commands/ent/
+  internal/vendored/ipsw_entitlements/ <- ipsw internal/codesign/entitlements/
+  internal/vendored/ipsw_utils/        <- ipsw internal/utils/
+
+Modifications to vendored code:
+  - Package names changed to vmacho / vent / ventitlements / vutils
+  - Unused functions pruned (DiffIPSW, DiffFirmwares, *LowMemory in macho/diff.go;
+    XCFramework/SwiftPackage in objc.go; Interface/WriteHeaders in swift.go;
+    macOS/USB helpers in utils.go)
+  - Import paths rewritten to point at vendored siblings

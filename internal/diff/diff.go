@@ -76,8 +76,10 @@ type Diff struct {
 	New *bundle.Bundle `json:"-"`
 
 	Machos       *vmacho.MachoDiff `json:"machos,omitempty"`
-	ObjC         string            `json:"objc,omitempty"`
-	Swift        string            `json:"swift,omitempty"`
+	// ObjC and Swift are keyed by bundle-relative path so the renderer
+	// can co-locate each binary's metadata diff with its structural diff.
+	ObjC         map[string]string `json:"objc,omitempty"`
+	Swift        map[string]string `json:"swift,omitempty"`
 	Plists       *PlistDiff        `json:"plists,omitempty"`
 	Ents         string            `json:"entitlements,omitempty"`
 	Provisioning string            `json:"provisioning,omitempty"`

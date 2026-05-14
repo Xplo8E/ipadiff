@@ -31,15 +31,17 @@ func (d *Diff) diffSwift() error {
 }
 
 // diffPerBinary computes a textual dump for every Mach-O present on
-// BOTH sides, then unified-diffs the two dumps. Encrypted binaries are
-// skipped — their ObjC/Swift sections live in encrypted segments.
-// The dumper itself recovers from panics (see vmacho/dump.go) so a single
-// bad binary cannot bring the whole section down.
-func diffPerBinary(oldB, newB *bundle.Bundle, dump func(*macho.File) (string, error)) string {
+// BOTH sides, then unified-diffs the two dumps. Returns a map keyed by
+// bundle-relative path so the renderer can co-locate each binary's
+// metadata with its structural diff. Encrypted binaries are skipped —
+// their ObjC/Swift sections live in encrypted segments. The dumper
+// itself recovers from panics (see vmacho/dump.go) so a single bad
+// binary cannot bring the whole section down.
+func diffPerBinary(oldB, newB *bundle.Bundle, dump func(*macho.File) (string, error)) map[string]string {
 	keys := commonMachoKeys(oldB, newB)
 	sort.Strings(keys)
 
-	var b strings.Builder
+	out := make(map[string]string)
 	for i, rel := range keys {
 		log.WithFields(log.Fields{
 			"binary": rel,
@@ -58,15 +60,13 @@ func diffPerBinary(oldB, newB *bundle.Bundle, dump func(*macho.File) (string, er
 			continue
 		}
 
-		out, err := vutils.GitDiff(oldDump+"\n", newDump+"\n", &vutils.GitDiffConfig{Tool: "git"})
-		if err != nil || len(strings.TrimSpace(out)) == 0 {
+		diff, err := vutils.GitDiff(oldDump+"\n", newDump+"\n", &vutils.GitDiffConfig{Tool: "git"})
+		if err != nil || len(strings.TrimSpace(diff)) == 0 {
 			continue
 		}
-		// Collapsed per-binary block — the diff body inside <details> stays
-		// off-screen until the user expands it.
-		fmt.Fprintf(&b, "<details>\n<summary><code>%s</code></summary>\n\n```diff\n%s\n```\n\n</details>\n\n", rel, out)
+		out[rel] = diff
 	}
-	return b.String()
+	return out
 }
 
 func commonMachoKeys(o, n *bundle.Bundle) []string {

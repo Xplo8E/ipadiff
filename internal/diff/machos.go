@@ -28,6 +28,11 @@ func (d *Diff) diffMachos() error {
 	prev := collectMachos(d.Old, conf)
 	next := collectMachos(d.New, conf)
 
+	// Snapshot main-exe DiffInfo on each side so the intel renderer can
+	// reuse it later (it would otherwise be GC'd after Generate).
+	d.mainOld = prev[d.Old.ExeName]
+	d.mainNew = next[d.New.ExeName]
+
 	d.Machos = &vmacho.MachoDiff{Updated: make(map[string]string)}
 	return d.Machos.Generate(prev, next, conf)
 }

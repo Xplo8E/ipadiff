@@ -86,6 +86,14 @@ type Diff struct {
 	Resources    *ResourcesDiff    `json:"resources,omitempty"`
 	FileTree     *FileTreeDiff     `json:"file_tree,omitempty"`
 
+	// mainOld / mainNew retain the raw DiffInfo for the main app binary
+	// on each side so the intelligence renderer can pull structured data
+	// (imports, cstrings, symbols, sections) without re-parsing the
+	// already-rendered ```diff body. Unexported — internal to the
+	// renderer pipeline.
+	mainOld *vmacho.DiffInfo
+	mainNew *vmacho.DiffInfo
+
 	cfg *Config
 }
 

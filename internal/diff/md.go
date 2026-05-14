@@ -139,17 +139,25 @@ func uniqueName(used map[string]bool, candidate string) string {
 // ----- per-binary file body -----------------------------------------------
 
 // renderBinaryFile is the single source of truth for "everything about
-// one binary": structural diff body + this-binary's ObjC dump diff + this-
-// binary's Swift dump diff. Used for the main app file and every entry
-// under FRAMEWORKS/ and PLUGINS/.
+// one binary": optional intelligence layer (main exe only in v1) +
+// structural diff body + ObjC + Swift. Used for the main app file and
+// every entry under FRAMEWORKS/ and PLUGINS/.
 func renderBinaryFile(rel string, d *Diff) string {
 	var b strings.Builder
 	fmt.Fprintf(&b, "# %s\n\n", rel)
 	if d.Old.Files[rel].Encrypted || d.New.Files[rel].Encrypted {
 		b.WriteString("> ⚠️ encrypted: structural diff only — symbols / cstrings / Obj-C / Swift skipped\n\n")
 	}
+
+	// Intelligence layer — main exe only in v1. Frameworks/plugins keep the
+	// flat layout below until we retain DiffInfo for every binary.
+	if isMainExe(rel, d) && d.mainOld != nil && d.mainNew != nil {
+		renderIntel(&b, rel, d)
+	}
+
 	if d.Machos != nil {
 		if structDiff, ok := d.Machos.Updated[rel]; ok {
+			b.WriteString("## Structural Diff\n\n")
 			b.WriteString(structDiff)
 			b.WriteString("\n")
 		}
@@ -165,6 +173,243 @@ func renderBinaryFile(rel string, d *Diff) string {
 		b.WriteString("\n```\n\n")
 	}
 	return b.String()
+}
+
+func isMainExe(rel string, d *Diff) bool {
+	return rel == d.New.ExeName || rel == d.Old.ExeName
+}
+
+// renderIntel writes the security-findings + metadata + linked-libraries +
+// string-intelligence + ObjC/Swift-summary sections at the top of a
+// per-binary report. All sections are omitted when their underlying data
+// is empty (e.g. encrypted binary has no cstring intel).
+func renderIntel(b *strings.Builder, rel string, d *Diff) {
+	imports := classifyImportsForMain(d)
+	strs := classifyStringsForMain(d)
+	objcSummary := summarizeObjCDiff(d.ObjC[rel])
+	swiftSummary := summarizeSwiftDiff(d.Swift[rel])
+	findings := AggregateFindings(imports, strs, objcSummary, swiftSummary)
+
+	renderFindings(b, findings)
+	renderMetadataTable(b, d)
+	renderLinkedLibs(b, imports)
+	renderStringIntel(b, strs)
+	renderObjCSummary(b, objcSummary)
+	renderSwiftSummary(b, swiftSummary)
+}
+
+// classifyImportsForMain returns nil when the main exe DiffInfo isn't
+// available on either side (degenerate case — caller should already have
+// gated on this, but be defensive).
+func classifyImportsForMain(d *Diff) *ImportIntel {
+	if d.mainOld == nil || d.mainNew == nil {
+		return nil
+	}
+	added, removed := vmacho.DiffImports(d.mainOld, d.mainNew)
+	return ClassifyImportDelta(added, removed)
+}
+
+func classifyStringsForMain(d *Diff) *StringIntel {
+	if d.mainOld == nil || d.mainNew == nil {
+		return nil
+	}
+	added, removed := vmacho.DiffCStringsTyped(d.mainOld, d.mainNew)
+	return ClassifyStringDelta(added, removed)
+}
+
+func renderFindings(b *strings.Builder, fs []Finding) {
+	if len(fs) == 0 {
+		return
+	}
+	high, med, info := FindingCounts(fs)
+	if high+med+info == 0 {
+		return
+	}
+	b.WriteString("## 🚦 Security-Relevant Findings\n\n")
+	for _, tier := range []Tier{TierHigh, TierMedium, TierInfo} {
+		bucket := filterByTier(fs, tier)
+		if len(bucket) == 0 {
+			continue
+		}
+		var label string
+		switch tier {
+		case TierHigh:
+			label = "🔴 High"
+		case TierMedium:
+			label = "🟡 Medium"
+		case TierInfo:
+			label = "⚪ Info"
+		}
+		fmt.Fprintf(b, "### %s (%d)\n\n", label, len(bucket))
+		for _, f := range bucket {
+			fmt.Fprintf(b, "- %s — _%s_\n", f.Text, f.Reason)
+		}
+		b.WriteString("\n")
+	}
+}
+
+func filterByTier(fs []Finding, t Tier) []Finding {
+	var out []Finding
+	for _, f := range fs {
+		if f.Tier == t {
+			out = append(out, f)
+		}
+	}
+	return out
+}
+
+func renderMetadataTable(b *strings.Builder, d *Diff) {
+	o, n := d.mainOld, d.mainNew
+	if o == nil || n == nil {
+		return
+	}
+	b.WriteString("## Mach-O Metadata\n\n")
+	b.WriteString("| Field | Old | New |\n")
+	b.WriteString("| :-- | :-- | :-- |\n")
+	rowEq(b, "UUID", o.UUID, n.UUID)
+	rowEq(b, "Source Version", o.Version, n.Version)
+	fmt.Fprintf(b, "| **Sections** | %d | %d |\n", len(o.Sections), len(n.Sections))
+	fmt.Fprintf(b, "| **Imports** | %d | %d |\n", len(o.Imports), len(n.Imports))
+	fmt.Fprintf(b, "| **Symbols** | %d | %d |\n", len(o.Symbols), len(n.Symbols))
+	fmt.Fprintf(b, "| **Functions** | %d | %d |\n", o.Functions, n.Functions)
+	fmt.Fprintf(b, "| **CStrings** | %d | %d |\n", len(o.CStrings), len(n.CStrings))
+	if o.Encrypted || n.Encrypted {
+		fmt.Fprintf(b, "| **Encrypted** | %v | %v |\n", o.Encrypted, n.Encrypted)
+	}
+	b.WriteString("\n")
+}
+
+// rowEq emits a markdown row with code-fences around values, and prepends
+// a "~" delta marker when old != new to draw the eye.
+func rowEq(b *strings.Builder, field, oldV, newV string) {
+	marker := "**"
+	if oldV != newV {
+		marker = "~~**"
+	}
+	_ = marker // mainly here for future formatting; basic row below
+	if oldV == newV {
+		fmt.Fprintf(b, "| %s | `%s` | `%s` |\n", field, truncate(oldV, 40), truncate(newV, 40))
+	} else {
+		fmt.Fprintf(b, "| **%s** | `%s` | `%s` |\n", field, truncate(oldV, 40), truncate(newV, 40))
+	}
+}
+
+func truncate(s string, n int) string {
+	if len(s) <= n {
+		return s
+	}
+	return s[:n-1] + "…"
+}
+
+func renderLinkedLibs(b *strings.Builder, imp *ImportIntel) {
+	if imp == nil {
+		return
+	}
+	if mapEmpty(imp.Added) && mapEmpty(imp.Removed) {
+		return
+	}
+	b.WriteString("## Linked Libraries\n\n")
+	if !mapEmpty(imp.Added) {
+		fmt.Fprintf(b, "### 🆕 Added (%d)\n\n", mapLen(imp.Added))
+		b.WriteString("| Library | Category |\n| :-- | :-- |\n")
+		for _, cat := range fwCategoryOrder {
+			for _, lib := range imp.Added[cat] {
+				fmt.Fprintf(b, "| `%s` | %s |\n", lib, cat)
+			}
+		}
+		b.WriteString("\n")
+	}
+	if !mapEmpty(imp.Removed) {
+		fmt.Fprintf(b, "### ❌ Removed (%d)\n\n", mapLen(imp.Removed))
+		b.WriteString("| Library | Category |\n| :-- | :-- |\n")
+		for _, cat := range fwCategoryOrder {
+			for _, lib := range imp.Removed[cat] {
+				fmt.Fprintf(b, "| `%s` | %s |\n", lib, cat)
+			}
+		}
+		b.WriteString("\n")
+	}
+}
+
+func renderStringIntel(b *strings.Builder, si *StringIntel) {
+	if si == nil {
+		return
+	}
+	if mapEmpty(si.Added) && mapEmpty(si.Removed) {
+		return
+	}
+	b.WriteString("## String Intelligence\n\n")
+	renderStringBuckets(b, "🆕 New", si.Added)
+	renderStringBuckets(b, "❌ Removed", si.Removed)
+}
+
+func renderStringBuckets(b *strings.Builder, label string, buckets map[stringCategory][]string) {
+	if mapEmpty(buckets) {
+		return
+	}
+	for _, cat := range stringCategoryOrder {
+		items := buckets[cat]
+		if len(items) == 0 {
+			continue
+		}
+		fmt.Fprintf(b, "### %s %s (%d)\n\n", label, cat, len(items))
+		// Long unclassified buckets get a <details> wrapper.
+		wrap := cat == catUnclassified && len(items) > 10
+		if wrap {
+			b.WriteString("<details>\n<summary><i>show</i></summary>\n\n")
+		}
+		for _, s := range items {
+			fmt.Fprintf(b, "- `%s`\n", escapeBacktick(s))
+		}
+		if wrap {
+			b.WriteString("\n</details>\n")
+		}
+		b.WriteString("\n")
+	}
+}
+
+// escapeBacktick replaces backticks with a doubled fence so they don't
+// break the surrounding inline-code span. Cheap, not full markdown
+// escaping — strings with embedded markdown are still rendered roughly.
+func escapeBacktick(s string) string {
+	return strings.ReplaceAll(s, "`", "ʼ")
+}
+
+func renderObjCSummary(b *strings.Builder, s metaSummary) {
+	if s.empty() {
+		return
+	}
+	fmt.Fprintf(b, "## Obj-C Summary\n\n_+%d classes / -%d, +%d methods / -%d, +%d protocols / -%d_\n\n",
+		s.AddedClasses, s.RemovedClasses,
+		s.AddedMethods, s.RemovedMethods,
+		s.AddedProtocols, s.RemovedProtocols)
+}
+
+func renderSwiftSummary(b *strings.Builder, s metaSummary) {
+	if s.empty() {
+		return
+	}
+	fmt.Fprintf(b, "## Swift Summary\n\n_+%d types / -%d, +%d funcs / -%d, +%d protocols / -%d_\n\n",
+		s.AddedClasses, s.RemovedClasses,
+		s.AddedMethods, s.RemovedMethods,
+		s.AddedProtocols, s.RemovedProtocols)
+}
+
+func mapEmpty[K comparable, V any](m map[K][]V) bool {
+	for _, v := range m {
+		if len(v) > 0 {
+			return false
+		}
+	}
+	return true
+}
+
+func mapLen[K comparable, V any](m map[K][]V) int {
+	n := 0
+	for _, v := range m {
+		n += len(v)
+	}
+	return n
 }
 
 // allBinaryRelPaths returns every bundle-relative path that has any
@@ -341,6 +586,28 @@ func renderStats(b *strings.Builder, d *Diff, links *readmeLinks) {
 		fmt.Fprintf(b, "- **Main binary** (`%s`) — updated\n", mainExe)
 	default:
 		fmt.Fprintf(b, "- **Main binary** (`%s`) — unchanged\n", mainExe)
+	}
+
+	// When the main exe has intel data available, surface a per-tier
+	// finding count immediately below the link. Lets the reader see "3
+	// high-interest changes" without clicking through to the report.
+	if mainChanged && d.mainOld != nil && d.mainNew != nil {
+		imp := classifyImportsForMain(d)
+		strs := classifyStringsForMain(d)
+		objc := summarizeObjCDiff(d.ObjC[mainExe])
+		swift := summarizeSwiftDiff(d.Swift[mainExe])
+		high, med, info := FindingCounts(AggregateFindings(imp, strs, objc, swift))
+		if high > 0 {
+			fmt.Fprintf(b, "  - 🔴 %d high-interest finding(s)\n", high)
+		}
+		if med > 0 {
+			fmt.Fprintf(b, "  - 🟡 %d medium-interest finding(s)\n", med)
+		}
+		if info > 0 && high+med == 0 {
+			// Only show info-tier when nothing higher exists, to keep the
+			// dashboard tight.
+			fmt.Fprintf(b, "  - ⚪ %d info-level finding(s)\n", info)
+		}
 	}
 
 	// Mach-Os: roll up across non-main binaries.

@@ -55,6 +55,54 @@ func diffNormalizedCStrings(oldValues, newValues []string) ([]string, []string) 
 	return added, removed
 }
 
+// DiffImports returns sorted (added, removed) sets across two DiffInfos'
+// Imports lists. Safe with nil inputs (treated as empty).
+func DiffImports(oldI, newI *DiffInfo) (added, removed []string) {
+	return setDiff(infoImports(newI), infoImports(oldI))
+}
+
+// DiffCStringsTyped returns sorted (added, removed) sets across the
+// cstring lists of two DiffInfos, after the same XBS path normalization
+// that FormatUpdatedDiff uses. Safe with nil inputs (treated as empty).
+func DiffCStringsTyped(oldI, newI *DiffInfo) (added, removed []string) {
+	return diffNormalizedCStrings(infoCStrings(oldI), infoCStrings(newI))
+}
+
+// DiffSymbols returns sorted (added, removed) sets across the symbol
+// lists of two DiffInfos. Safe with nil inputs (treated as empty).
+func DiffSymbols(oldI, newI *DiffInfo) (added, removed []string) {
+	return setDiff(infoSymbols(newI), infoSymbols(oldI))
+}
+
+func setDiff(a, b []string) (added, removed []string) {
+	added = vutils.Difference(a, b)
+	sort.Strings(added)
+	removed = vutils.Difference(b, a)
+	sort.Strings(removed)
+	return
+}
+
+func infoImports(i *DiffInfo) []string {
+	if i == nil {
+		return nil
+	}
+	return i.Imports
+}
+
+func infoCStrings(i *DiffInfo) []string {
+	if i == nil {
+		return nil
+	}
+	return i.CStrings
+}
+
+func infoSymbols(i *DiffInfo) []string {
+	if i == nil {
+		return nil
+	}
+	return i.Symbols
+}
+
 type DiffConfig struct {
 	Markdown   bool
 	Color      bool

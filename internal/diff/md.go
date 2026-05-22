@@ -1,6 +1,7 @@
 package diff
 
 import (
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -10,6 +11,11 @@ import (
 	"unicode"
 
 	vmacho "github.com/Xplo8E/ipadiff/internal/vendored/ipsw_macho"
+)
+
+const (
+	spillEntryThreshold = 25
+	spillByteThreshold  = 200 * 1024
 )
 
 // Markdown writes a Markdown report for d. When d.cfg.Output is empty the
@@ -22,17 +28,40 @@ import (
 //	<Output>/<bundleDirName>/PLUGINS/*.md          one per .appex / Watch / XPC / loose dylib
 //	<Output>/<bundleDirName>/PLISTS/*.md           one per updated plist (no index entries)
 func (d *Diff) Markdown(w io.Writer) error {
-	if d.cfg.Output == "" {
-		_, err := io.WriteString(w, renderReadme(d, nil))
-		return err
+	if d.cfg == nil || d.cfg.Output == "" {
+		return d.WriteMarkdown(w)
 	}
-	return d.writeMultiFile()
+	return d.WriteFiles(d.cfg.Output)
+}
+
+// WriteMarkdown streams a single-file Markdown report to w, regardless of
+// Config.Output. Use WriteFiles for the multi-file layout.
+func (d *Diff) WriteMarkdown(w io.Writer) error {
+	_, err := io.WriteString(w, renderReadme(d, nil))
+	return err
+}
+
+// WriteFiles writes the multi-file Markdown layout under
+// <output>/<bundleDirName>. If output is empty, Config.Output is used, then
+// DefaultOutputDir as the final fallback.
+func (d *Diff) WriteFiles(output string) error {
+	if output == "" && d.cfg != nil {
+		output = d.cfg.Output
+	}
+	if output == "" {
+		output = DefaultOutputDir
+	}
+	return d.writeMultiFile(output)
 }
 
 // OutputDir returns the absolute path of the per-diff folder that
 // writeMultiFile will create: <cfg.Output>/<bundleDirName>.
 func (d *Diff) OutputDir() string {
-	return filepath.Join(d.cfg.Output, d.BundleDirName())
+	output := DefaultOutputDir
+	if d.cfg != nil && d.cfg.Output != "" {
+		output = d.cfg.Output
+	}
+	return filepath.Join(output, d.BundleDirName())
 }
 
 // BundleDirName builds the conventional per-diff subdirectory name:
@@ -139,21 +168,16 @@ func uniqueName(used map[string]bool, candidate string) string {
 // ----- per-binary file body -----------------------------------------------
 
 // renderBinaryFile is the single source of truth for "everything about
-// one binary": optional intelligence layer (main exe only in v1) +
-// structural diff body + ObjC + Swift. Used for the main app file and
-// every entry under FRAMEWORKS/ and PLUGINS/.
+// one binary": neutral Mach-O metadata + raw structural diff + ObjC +
+// Swift. Used for the main app file and every entry under FRAMEWORKS/
+// and PLUGINS/.
 func renderBinaryFile(rel string, d *Diff) string {
 	var b strings.Builder
 	fmt.Fprintf(&b, "# %s\n\n", rel)
 	if d.Old.Files[rel].Encrypted || d.New.Files[rel].Encrypted {
 		b.WriteString("> ⚠️ encrypted: structural diff only — symbols / cstrings / Obj-C / Swift skipped\n\n")
 	}
-
-	// Intelligence layer — main exe only in v1. Frameworks/plugins keep the
-	// flat layout below until we retain DiffInfo for every binary.
-	if isMainExe(rel, d) && d.mainOld != nil && d.mainNew != nil {
-		renderIntel(&b, rel, d)
-	}
+	renderMetadataTable(&b, d.oldInfos[rel], d.newInfos[rel])
 
 	if d.Machos != nil {
 		if structDiff, ok := d.Machos.Updated[rel]; ok {
@@ -175,91 +199,7 @@ func renderBinaryFile(rel string, d *Diff) string {
 	return b.String()
 }
 
-func isMainExe(rel string, d *Diff) bool {
-	return rel == d.New.ExeName || rel == d.Old.ExeName
-}
-
-// renderIntel writes the security-findings + metadata + linked-libraries +
-// string-intelligence + ObjC/Swift-summary sections at the top of a
-// per-binary report. All sections are omitted when their underlying data
-// is empty (e.g. encrypted binary has no cstring intel).
-func renderIntel(b *strings.Builder, rel string, d *Diff) {
-	imports := classifyImportsForMain(d)
-	strs := classifyStringsForMain(d)
-	objcSummary := summarizeObjCDiff(d.ObjC[rel])
-	swiftSummary := summarizeSwiftDiff(d.Swift[rel])
-	findings := AggregateFindings(imports, strs, objcSummary, swiftSummary)
-
-	renderFindings(b, findings)
-	renderMetadataTable(b, d)
-	renderLinkedLibs(b, imports)
-	renderStringIntel(b, strs)
-	renderObjCSummary(b, objcSummary)
-	renderSwiftSummary(b, swiftSummary)
-}
-
-// classifyImportsForMain returns nil when the main exe DiffInfo isn't
-// available on either side (degenerate case — caller should already have
-// gated on this, but be defensive).
-func classifyImportsForMain(d *Diff) *ImportIntel {
-	if d.mainOld == nil || d.mainNew == nil {
-		return nil
-	}
-	added, removed := vmacho.DiffImports(d.mainOld, d.mainNew)
-	return ClassifyImportDelta(added, removed)
-}
-
-func classifyStringsForMain(d *Diff) *StringIntel {
-	if d.mainOld == nil || d.mainNew == nil {
-		return nil
-	}
-	added, removed := vmacho.DiffCStringsTyped(d.mainOld, d.mainNew)
-	return ClassifyStringDelta(added, removed)
-}
-
-func renderFindings(b *strings.Builder, fs []Finding) {
-	if len(fs) == 0 {
-		return
-	}
-	high, med, info := FindingCounts(fs)
-	if high+med+info == 0 {
-		return
-	}
-	b.WriteString("## 🚦 Security-Relevant Findings\n\n")
-	for _, tier := range []Tier{TierHigh, TierMedium, TierInfo} {
-		bucket := filterByTier(fs, tier)
-		if len(bucket) == 0 {
-			continue
-		}
-		var label string
-		switch tier {
-		case TierHigh:
-			label = "🔴 High"
-		case TierMedium:
-			label = "🟡 Medium"
-		case TierInfo:
-			label = "⚪ Info"
-		}
-		fmt.Fprintf(b, "### %s (%d)\n\n", label, len(bucket))
-		for _, f := range bucket {
-			fmt.Fprintf(b, "- %s — _%s_\n", f.Text, f.Reason)
-		}
-		b.WriteString("\n")
-	}
-}
-
-func filterByTier(fs []Finding, t Tier) []Finding {
-	var out []Finding
-	for _, f := range fs {
-		if f.Tier == t {
-			out = append(out, f)
-		}
-	}
-	return out
-}
-
-func renderMetadataTable(b *strings.Builder, d *Diff) {
-	o, n := d.mainOld, d.mainNew
+func renderMetadataTable(b *strings.Builder, o, n *vmacho.DiffInfo) {
 	if o == nil || n == nil {
 		return
 	}
@@ -301,117 +241,6 @@ func truncate(s string, n int) string {
 	return s[:n-1] + "…"
 }
 
-func renderLinkedLibs(b *strings.Builder, imp *ImportIntel) {
-	if imp == nil {
-		return
-	}
-	if mapEmpty(imp.Added) && mapEmpty(imp.Removed) {
-		return
-	}
-	b.WriteString("## Linked Libraries\n\n")
-	if !mapEmpty(imp.Added) {
-		fmt.Fprintf(b, "### 🆕 Added (%d)\n\n", mapLen(imp.Added))
-		b.WriteString("| Library | Category |\n| :-- | :-- |\n")
-		for _, cat := range fwCategoryOrder {
-			for _, lib := range imp.Added[cat] {
-				fmt.Fprintf(b, "| `%s` | %s |\n", lib, cat)
-			}
-		}
-		b.WriteString("\n")
-	}
-	if !mapEmpty(imp.Removed) {
-		fmt.Fprintf(b, "### ❌ Removed (%d)\n\n", mapLen(imp.Removed))
-		b.WriteString("| Library | Category |\n| :-- | :-- |\n")
-		for _, cat := range fwCategoryOrder {
-			for _, lib := range imp.Removed[cat] {
-				fmt.Fprintf(b, "| `%s` | %s |\n", lib, cat)
-			}
-		}
-		b.WriteString("\n")
-	}
-}
-
-func renderStringIntel(b *strings.Builder, si *StringIntel) {
-	if si == nil {
-		return
-	}
-	if mapEmpty(si.Added) && mapEmpty(si.Removed) {
-		return
-	}
-	b.WriteString("## String Intelligence\n\n")
-	renderStringBuckets(b, "🆕 New", si.Added)
-	renderStringBuckets(b, "❌ Removed", si.Removed)
-}
-
-func renderStringBuckets(b *strings.Builder, label string, buckets map[stringCategory][]string) {
-	if mapEmpty(buckets) {
-		return
-	}
-	for _, cat := range stringCategoryOrder {
-		items := buckets[cat]
-		if len(items) == 0 {
-			continue
-		}
-		fmt.Fprintf(b, "### %s %s (%d)\n\n", label, cat, len(items))
-		// Long unclassified buckets get a <details> wrapper.
-		wrap := cat == catUnclassified && len(items) > 10
-		if wrap {
-			b.WriteString("<details>\n<summary><i>show</i></summary>\n\n")
-		}
-		for _, s := range items {
-			fmt.Fprintf(b, "- `%s`\n", escapeBacktick(s))
-		}
-		if wrap {
-			b.WriteString("\n</details>\n")
-		}
-		b.WriteString("\n")
-	}
-}
-
-// escapeBacktick replaces backticks with a doubled fence so they don't
-// break the surrounding inline-code span. Cheap, not full markdown
-// escaping — strings with embedded markdown are still rendered roughly.
-func escapeBacktick(s string) string {
-	return strings.ReplaceAll(s, "`", "ʼ")
-}
-
-func renderObjCSummary(b *strings.Builder, s metaSummary) {
-	if s.empty() {
-		return
-	}
-	fmt.Fprintf(b, "## Obj-C Summary\n\n_+%d classes / -%d, +%d methods / -%d, +%d protocols / -%d_\n\n",
-		s.AddedClasses, s.RemovedClasses,
-		s.AddedMethods, s.RemovedMethods,
-		s.AddedProtocols, s.RemovedProtocols)
-}
-
-func renderSwiftSummary(b *strings.Builder, s metaSummary) {
-	if s.empty() {
-		return
-	}
-	fmt.Fprintf(b, "## Swift Summary\n\n_+%d types / -%d, +%d funcs / -%d, +%d protocols / -%d_\n\n",
-		s.AddedClasses, s.RemovedClasses,
-		s.AddedMethods, s.RemovedMethods,
-		s.AddedProtocols, s.RemovedProtocols)
-}
-
-func mapEmpty[K comparable, V any](m map[K][]V) bool {
-	for _, v := range m {
-		if len(v) > 0 {
-			return false
-		}
-	}
-	return true
-}
-
-func mapLen[K comparable, V any](m map[K][]V) int {
-	n := 0
-	for _, v := range m {
-		n += len(v)
-	}
-	return n
-}
-
 // allBinaryRelPaths returns every bundle-relative path that has any
 // content to render (structural diff, Obj-C diff, or Swift diff). The
 // union covers the case where a binary is structurally identical but
@@ -439,8 +268,14 @@ func (d *Diff) allBinaryRelPaths() []string {
 
 // ----- writeMultiFile -----------------------------------------------------
 
-func (d *Diff) writeMultiFile() error {
-	root := d.OutputDir()
+func (d *Diff) writeMultiFile(output string) error {
+	root, err := d.safeOutputRoot(output)
+	if err != nil {
+		return err
+	}
+	if err := os.RemoveAll(root); err != nil {
+		return fmt.Errorf("reset output dir: %w", err)
+	}
 	if err := os.MkdirAll(root, 0o755); err != nil {
 		return fmt.Errorf("mkdir output dir: %w", err)
 	}
@@ -451,7 +286,7 @@ func (d *Diff) writeMultiFile() error {
 	}
 
 	used := map[string]bool{}
-	links := readmeLinks{}
+	links := readmeLinks{binaryFiles: map[string]string{}}
 
 	// Track whether at least one binary in each non-main bucket exists,
 	// so renderStats can decide whether to surface the dir-link.
@@ -469,6 +304,7 @@ func (d *Diff) writeMultiFile() error {
 				return err
 			}
 			links.main = fname
+			links.binaryFiles[rel] = fname
 		case binFramework:
 			if !hasFrameworkDir {
 				if err := os.MkdirAll(filepath.Join(root, "FRAMEWORKS"), 0o755); err != nil {
@@ -481,6 +317,7 @@ func (d *Diff) writeMultiFile() error {
 			if err := os.WriteFile(filepath.Join(root, rel2), []byte(body), 0o644); err != nil {
 				return err
 			}
+			links.binaryFiles[rel] = rel2
 		case binPlugin:
 			if !hasPluginDir {
 				if err := os.MkdirAll(filepath.Join(root, "PLUGINS"), 0o755); err != nil {
@@ -493,6 +330,7 @@ func (d *Diff) writeMultiFile() error {
 			if err := os.WriteFile(filepath.Join(root, rel2), []byte(body), 0o644); err != nil {
 				return err
 			}
+			links.binaryFiles[rel] = rel2
 		}
 	}
 	links.hasFrameworks = hasFrameworkDir
@@ -500,22 +338,39 @@ func (d *Diff) writeMultiFile() error {
 
 	// Per-plist files — README links to the folder only, no per-file index.
 	if d.Plists != nil && len(d.Plists.Updated) > 0 {
-		if err := os.MkdirAll(filepath.Join(root, "PLISTS"), 0o755); err != nil {
+		pages := buildPlistPages(d.Plists)
+		if len(pages) > 0 {
+			if err := os.MkdirAll(filepath.Join(root, "PLISTS"), 0o755); err != nil {
+				return err
+			}
+			for _, page := range pages {
+				rel2 := uniqueName(used, "PLISTS"+string(filepath.Separator)+safeName(page.displayPath)+".md")
+				if err := os.WriteFile(filepath.Join(root, rel2), []byte(page.body), 0o644); err != nil {
+					return err
+				}
+			}
+			links.hasPlists = true
+		}
+	}
+
+	if shouldSpillResources(d.Resources) {
+		if err := os.MkdirAll(filepath.Join(root, "RESOURCES"), 0o755); err != nil {
 			return err
 		}
-		keys := make([]string, 0, len(d.Plists.Updated))
-		for k := range d.Plists.Updated {
-			keys = append(keys, k)
-		}
-		sort.Strings(keys)
-		for _, rel := range keys {
-			rel2 := uniqueName(used, "PLISTS"+string(filepath.Separator)+safeName(rel)+".md")
-			page := fmt.Sprintf("# %s\n\n%s\n", rel, d.Plists.Updated[rel])
-			if err := os.WriteFile(filepath.Join(root, rel2), []byte(page), 0o644); err != nil {
+		pages := buildResourcePages(d.Resources)
+		for _, page := range pages {
+			rel2 := "RESOURCES" + string(filepath.Separator) + page.fileName
+			if err := os.WriteFile(filepath.Join(root, rel2), []byte(page.body), 0o644); err != nil {
 				return err
 			}
 		}
-		links.hasPlists = true
+		links.hasResources = true
+	}
+
+	if ok, err := d.writeHermesFiles(root); err != nil {
+		return err
+	} else if ok {
+		links.hasHermes = true
 	}
 
 	return os.WriteFile(
@@ -523,6 +378,34 @@ func (d *Diff) writeMultiFile() error {
 		[]byte(renderReadme(d, &links)),
 		0o644,
 	)
+}
+
+func (d *Diff) safeOutputRoot(output string) (string, error) {
+	if strings.TrimSpace(output) == "" {
+		return "", errors.New("output directory is empty")
+	}
+	bundleDir := d.BundleDirName()
+	if bundleDir == "" || bundleDir == "." || bundleDir == string(filepath.Separator) {
+		return "", fmt.Errorf("unsafe bundle output directory %q", bundleDir)
+	}
+	root, err := filepath.Abs(filepath.Join(output, bundleDir))
+	if err != nil {
+		return "", fmt.Errorf("resolve output dir: %w", err)
+	}
+	root = filepath.Clean(root)
+	if filepath.Base(root) != bundleDir {
+		return "", fmt.Errorf("unsafe output dir %q: expected final component %q", root, bundleDir)
+	}
+	if root == string(filepath.Separator) {
+		return "", errors.New("refusing to delete filesystem root")
+	}
+	if home, err := os.UserHomeDir(); err == nil && filepath.Clean(home) == root {
+		return "", fmt.Errorf("refusing to delete home directory %q", root)
+	}
+	if cwd, err := os.Getwd(); err == nil && filepath.Clean(cwd) == root {
+		return "", fmt.Errorf("refusing to delete repository root %q", root)
+	}
+	return root, nil
 }
 
 // ----- README rendering ---------------------------------------------------
@@ -535,6 +418,9 @@ type readmeLinks struct {
 	hasFrameworks bool
 	hasPlugins    bool
 	hasPlists     bool
+	hasResources  bool
+	hasHermes     bool
+	binaryFiles   map[string]string
 }
 
 func renderReadme(d *Diff, links *readmeLinks) string {
@@ -542,10 +428,13 @@ func renderReadme(d *Diff, links *readmeLinks) string {
 	fmt.Fprintf(&b, "# %s\n\n", d.Title)
 	renderSummary(&b, d)
 	renderStats(&b, d, links)
+	renderWarnings(&b, d)
 	renderFileTree(&b, d)
 	renderEntitlements(&b, d)
 	renderProvisioning(&b, d)
-	renderResourcesInline(&b, d)
+	if links == nil || !links.hasResources {
+		renderResourcesInline(&b, d)
+	}
 	return b.String()
 }
 
@@ -588,28 +477,6 @@ func renderStats(b *strings.Builder, d *Diff, links *readmeLinks) {
 		fmt.Fprintf(b, "- **Main binary** (`%s`) — unchanged\n", mainExe)
 	}
 
-	// When the main exe has intel data available, surface a per-tier
-	// finding count immediately below the link. Lets the reader see "3
-	// high-interest changes" without clicking through to the report.
-	if mainChanged && d.mainOld != nil && d.mainNew != nil {
-		imp := classifyImportsForMain(d)
-		strs := classifyStringsForMain(d)
-		objc := summarizeObjCDiff(d.ObjC[mainExe])
-		swift := summarizeSwiftDiff(d.Swift[mainExe])
-		high, med, info := FindingCounts(AggregateFindings(imp, strs, objc, swift))
-		if high > 0 {
-			fmt.Fprintf(b, "  - 🔴 %d high-interest finding(s)\n", high)
-		}
-		if med > 0 {
-			fmt.Fprintf(b, "  - 🟡 %d medium-interest finding(s)\n", med)
-		}
-		if info > 0 && high+med == 0 {
-			// Only show info-tier when nothing higher exists, to keep the
-			// dashboard tight.
-			fmt.Fprintf(b, "  - ⚪ %d info-level finding(s)\n", info)
-		}
-	}
-
 	// Mach-Os: roll up across non-main binaries.
 	if d.Machos != nil {
 		nonMainUpdated := 0
@@ -640,7 +507,7 @@ func renderStats(b *strings.Builder, d *Diff, links *readmeLinks) {
 			suffix = " → [PLISTS/](./PLISTS/)"
 		}
 		fmt.Fprintf(b, "- **Plists** — %d new, %d removed, %d updated%s\n",
-			len(d.Plists.New), len(d.Plists.Removed), len(d.Plists.Updated), suffix)
+			len(d.Plists.New), len(d.Plists.Removed), plistUpdatedCount(d.Plists), suffix)
 	}
 
 	// Entitlements: count "###" headers in the rendered diff (one per
@@ -662,9 +529,23 @@ func renderStats(b *strings.Builder, d *Diff, links *readmeLinks) {
 
 	// Resources.
 	if d.Resources != nil {
-		fmt.Fprintf(b, "- **Resources** — %d new, %d removed, %d text updated, %d size-only\n",
+		suffix := ""
+		if links != nil && links.hasResources {
+			suffix = " → [RESOURCES/](./RESOURCES/)"
+		}
+		fmt.Fprintf(b, "- **Resources** — %d new, %d removed, %d text updated, %d size-only%s\n",
 			len(d.Resources.New), len(d.Resources.Removed),
-			len(d.Resources.Updated), len(d.Resources.SizeOnly))
+			len(d.Resources.Updated), len(d.Resources.SizeOnly), suffix)
+	}
+
+	// Hermes.
+	if d.Hermes != nil {
+		suffix := ""
+		if links != nil && links.hasHermes {
+			suffix = " → [HERMES/](./HERMES/)"
+		}
+		fmt.Fprintf(b, "- **Hermes bundles** — %d new, %d removed, %d updated%s\n",
+			len(d.Hermes.New), len(d.Hermes.Removed), len(d.Hermes.Updated), suffix)
 	}
 
 	b.WriteString("\n")
@@ -696,6 +577,21 @@ func countEntChanges(ents string) int {
 		count = 1
 	}
 	return count
+}
+
+func renderWarnings(b *strings.Builder, d *Diff) {
+	if len(d.Warnings) == 0 {
+		return
+	}
+	b.WriteString("## Warnings\n\n")
+	for _, warning := range d.Warnings {
+		label := warning.Section
+		if warning.Path != "" {
+			label += "/" + warning.Path
+		}
+		fmt.Fprintf(b, "- `%s` — %s\n", label, warning.Message)
+	}
+	b.WriteString("\n")
 }
 
 func renderFileTree(b *strings.Builder, d *Diff) {
@@ -760,6 +656,90 @@ func renderResourcesInline(b *strings.Builder, d *Diff) {
 	}
 }
 
+type resourcePage struct {
+	displayPath string
+	fileName    string
+	body        string
+}
+
+func shouldSpillResources(r *ResourcesDiff) bool {
+	if r == nil {
+		return false
+	}
+	if len(r.Updated) > spillEntryThreshold {
+		return true
+	}
+	var b strings.Builder
+	renderResourcesInline(&b, &Diff{Resources: r})
+	return b.Len() > spillByteThreshold
+}
+
+func buildResourcePages(r *ResourcesDiff) []resourcePage {
+	if r == nil {
+		return nil
+	}
+	var pages []resourcePage
+	updatedKeys := mapKeys(r.Updated)
+	sort.Strings(updatedKeys)
+	used := map[string]bool{"README.md": true}
+	for _, rel := range updatedKeys {
+		fileName := uniqueName(used, safeName(rel)+".md")
+		pages = append(pages, resourcePage{
+			displayPath: rel,
+			fileName:    fileName,
+			body:        fmt.Sprintf("# %s\n\n%s\n", rel, r.Updated[rel]),
+		})
+	}
+	pages = append([]resourcePage{{
+		fileName: "README.md",
+		body:     renderResourceIndex(r, pages),
+	}}, pages...)
+	return pages
+}
+
+func renderResourceIndex(r *ResourcesDiff, pages []resourcePage) string {
+	var b strings.Builder
+	b.WriteString("# Resources\n\n")
+	listBlock(&b, "🆕 New", r.New)
+	listBlock(&b, "❌ Removed", r.Removed)
+
+	if len(r.Updated) > 0 {
+		fmt.Fprintf(&b, "### ⬆️ Updated (text) (%d)\n\n", len(r.Updated))
+		keys := mapKeys(r.Updated)
+		sort.Strings(keys)
+		pageByRel := make(map[string]string, len(pages))
+		for _, page := range pages {
+			pageByRel[page.displayPath] = page.fileName
+		}
+		for _, rel := range keys {
+			fmt.Fprintf(&b, "- [`%s`](./%s)\n", rel, pageByRel[rel])
+		}
+		b.WriteString("\n")
+	}
+
+	if len(r.SizeOnly) > 0 {
+		b.WriteString("### 📦 Size changes (binary)\n\n")
+		keys := mapKeys(r.SizeOnly)
+		sort.Strings(keys)
+		for _, k := range keys {
+			fmt.Fprintf(&b, "- `%s` — %s\n", k, r.SizeOnly[k])
+		}
+		b.WriteString("\n")
+	}
+	return b.String()
+}
+
+type plistPage struct {
+	displayPath string
+	body        string
+}
+
+type localizedPlistGroup struct {
+	displayPath string
+	diffByRel   map[string]string
+	localeByRel map[string]string
+}
+
 // ----- helpers ------------------------------------------------------------
 
 func listBlock(b *strings.Builder, heading string, items []string) {
@@ -786,6 +766,140 @@ func mapKeys(m map[string]string) []string {
 		out = append(out, k)
 	}
 	return out
+}
+
+func buildPlistPages(pd *PlistDiff) []plistPage {
+	if pd == nil || len(pd.Updated) == 0 {
+		return nil
+	}
+
+	var pages []plistPage
+	groups := map[string]*localizedPlistGroup{}
+	for rel, diff := range pd.Updated {
+		key, locale, displayPath, ok := localizedPlistKey(rel)
+		if !ok {
+			pages = append(pages, plistPage{
+				displayPath: rel,
+				body:        fmt.Sprintf("# %s\n\n%s\n", rel, diff),
+			})
+			continue
+		}
+		group := groups[key]
+		if group == nil {
+			group = &localizedPlistGroup{
+				displayPath: displayPath,
+				diffByRel:   map[string]string{},
+				localeByRel: map[string]string{},
+			}
+			groups[key] = group
+		}
+		group.diffByRel[rel] = diff
+		group.localeByRel[rel] = locale
+	}
+
+	keys := make([]string, 0, len(groups))
+	for key := range groups {
+		keys = append(keys, key)
+	}
+	sort.Strings(keys)
+	for _, key := range keys {
+		group := groups[key]
+		if len(group.diffByRel) == 1 {
+			for rel, diff := range group.diffByRel {
+				pages = append(pages, plistPage{
+					displayPath: rel,
+					body:        fmt.Sprintf("# %s\n\n%s\n", rel, diff),
+				})
+			}
+			continue
+		}
+		pages = append(pages, plistPage{
+			displayPath: group.displayPath,
+			body:        renderLocalizedPlistPage(group),
+		})
+	}
+
+	sort.Slice(pages, func(i, j int) bool {
+		return pages[i].displayPath < pages[j].displayPath
+	})
+	return pages
+}
+
+func plistUpdatedCount(pd *PlistDiff) int {
+	return len(buildPlistPages(pd))
+}
+
+func localizedPlistKey(rel string) (key, locale, displayPath string, ok bool) {
+	parts := strings.Split(rel, string(filepath.Separator))
+	for idx, part := range parts {
+		if !strings.HasSuffix(part, ".lproj") || idx == len(parts)-1 {
+			continue
+		}
+		locale = strings.TrimSuffix(part, ".lproj")
+		displayParts := append([]string{}, parts[:idx]...)
+		displayParts = append(displayParts, "*.lproj")
+		displayParts = append(displayParts, parts[idx+1:]...)
+		displayPath = filepath.Join(displayParts...)
+		return displayPath, locale, displayPath, true
+	}
+	return "", "", "", false
+}
+
+func renderLocalizedPlistPage(group *localizedPlistGroup) string {
+	var b strings.Builder
+	paths := mapKeys(group.diffByRel)
+	sort.Slice(paths, func(i, j int) bool {
+		li, lj := group.localeByRel[paths[i]], group.localeByRel[paths[j]]
+		if localeSortRank(li) != localeSortRank(lj) {
+			return localeSortRank(li) < localeSortRank(lj)
+		}
+		if li != lj {
+			return li < lj
+		}
+		return paths[i] < paths[j]
+	})
+
+	locales := make([]string, 0, len(paths))
+	for _, rel := range paths {
+		locales = append(locales, group.localeByRel[rel])
+	}
+	representative := paths[0]
+
+	fmt.Fprintf(&b, "# %s\n\n", group.displayPath)
+	b.WriteString("## Localized Family\n\n")
+	fmt.Fprintf(&b, "- Representative path: `%s`\n", representative)
+	fmt.Fprintf(&b, "- Locales (%d): %s\n\n", len(locales), inlineCodeList(locales))
+
+	b.WriteString("## Paths\n\n")
+	for _, rel := range paths {
+		fmt.Fprintf(&b, "- `%s`\n", rel)
+	}
+	b.WriteString("\n## Representative Diff\n\n")
+	b.WriteString(group.diffByRel[representative])
+	b.WriteString("\n")
+	return b.String()
+}
+
+func localeSortRank(locale string) int {
+	switch locale {
+	case "Base":
+		return 0
+	case "en":
+		return 1
+	default:
+		return 2
+	}
+}
+
+func inlineCodeList(items []string) string {
+	if len(items) == 0 {
+		return ""
+	}
+	parts := make([]string, 0, len(items))
+	for _, item := range items {
+		parts = append(parts, fmt.Sprintf("`%s`", item))
+	}
+	return strings.Join(parts, ", ")
 }
 
 // TitleToFilename sanitizes a title into a safe filename. Vendored

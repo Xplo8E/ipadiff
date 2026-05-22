@@ -1,123 +1,223 @@
 # ipadiff
 
-Structural diff for two iOS `.ipa` files. Inspired by [`ipsw diff`](https://github.com/blacktop/ipsw) — same architecture, scoped down to app bundles.
+Structural diffing for two iOS `.ipa` files.
 
-Given two IPAs, `ipadiff` produces a Markdown report covering:
+`ipadiff` extracts both app bundles, compares the parts that matter, and writes a Markdown report. It is built for iOS reverse engineering, release review, and mobile security diffing.
 
-- **Mach-Os** — main app **plus every Mach-O anywhere in the bundle**: frameworks, app extensions (`*.appex`), nested frameworks inside extensions, watchOS companion binaries, XPC services, loose dylibs. Sections, symbols, function-starts size deltas, cstrings, imports.
-- **Obj-C / Swift metadata** — class/method/protocol dumps, textual diff.
-- **Plists** — Info.plist + every embedded plist (binary or XML, auto-canonicalized).
-- **Entitlements** — from each binary's code signature (XML or DER), with launch constraints.
-- **Provisioning profile** — diff of the embedded.mobileprovision inner plist.
-- **Resources** — `.strings`, `.json`, `.js`, `.html`, `.xml`, source files. Media (images/audio/video/fonts) is tracked at the file-tree level only.
-- **File tree** — bundle-wide new/removed paths.
+## Features
 
-`_CodeSignature/` directories are skipped (signing metadata, not app content). No external reverse engineering tools needed — no disassembly, no decompilation — just format-aware extraction and textual diffing.
+- Mach-O coverage for the main binary, frameworks, app extensions, nested frameworks, watch apps, XPC services, and loose dylibs.
+- Section, symbol, function-start, cstring, import, Obj-C, and Swift metadata diffs.
+- Entitlements and launch constraint diffs from code signatures.
+- `Info.plist`, embedded plist, and provisioning profile diffs.
+- React Native Hermes bytecode bundle diffs, including `main.jsbundle`, detected automatically by Hermes bytecode magic.
+- Resource diffs for text-like files such as `.json`, `.js`, `.html`, `.xml`, `.strings`, and source files.
+- Canonical JSON comparison, so key-order-only `.json` churn is ignored.
+- File-tree diff for new and removed bundle paths.
+- Multi-file Markdown output with spill directories for large sections.
 
-## Install
+`_CodeSignature/` directories are skipped because they are signing metadata, not app content.
+
+## Requirements
+
+- Go
+- Rust / Cargo
+- `git` on `PATH` for cleaner unified text diffs
+
+`git` is recommended, not mandatory. `ipadiff` falls back to the built-in Go diff path when needed.
+
+## Build
 
 ```bash
-go build -o bin/ipadiff ./cmd/ipadiff
+git clone https://github.com/Xplo8E/ipadiff
+cd ipadiff
+make build
 ```
 
-Requires Go 1.23+. `git` on PATH is recommended (used for prettier unified diffs); the tool falls back to a pure-Go diff engine otherwise.
+This builds `bin/ipadiff` and `bin/hermes-diff`.
+
+```bash
+make build   # build both binaries
+make install # install to $HOME/.local/bin
+make clean   # remove build artifacts
+```
+
+This installs both binaries into `$HOME/.local/bin`.
+
+Use `PREFIX` to install somewhere else:
+
+```bash
+make install PREFIX=/usr/local
+```
 
 ## Usage
 
 ```bash
-ipadiff <old.ipa> <new.ipa> [flags]
+./bin/ipadiff <old.ipa> <new.ipa>
 ```
 
-With no flags, output is written to `./ipa-diffs/<bundleID>_<oldVer>_<newVer>/`:
+Default output:
+
+```text
+ipa-diffs/<bundleID>_<oldVersion>_<newVersion>/
+```
+
+Example:
 
 ```bash
-ipadiff App-v1.ipa App-v2.ipa
-# wrote diff to ipa-diffs/com.example.app_1.0_2.0/
+./bin/ipadiff App-1.0.ipa App-2.0.ipa
 ```
 
-Pass `-o` to rename only the **outer** container directory. The inner `<bundleID>_<oldVer>_<newVer>/` folder name is always derived from the parsed bundle metadata:
+Use `-o` to choose the outer output directory:
 
 ```bash
-ipadiff App-v1.ipa App-v2.ipa -o myout
-# wrote diff to myout/com.example.app_1.0_2.0/
+./bin/ipadiff App-1.0.ipa App-2.0.ipa -o /tmp/ipa-review
 ```
 
-### Output layout
+The inner report directory is still derived from bundle metadata:
 
-```
-<outer>/<bundleID>_<oldVer>_<newVer>/
-├── README.md              ← index: title, links to main + spill subdirs
-├── <BundleName>.md        ← main report (e.g. ChatGPT.md, derived from CFBundleName)
-├── MACHOS/                ← per-binary diff files (only created when section spills)
-│   ├── ChatGPT.md
-│   ├── Frameworks_PhoneNumberKit.framework_PhoneNumberKit.md
-│   ├── PlugIns_ShareExtension.appex_ShareExtension.md
-│   └── …
-├── PLISTS/                ← only created when section spills (>25 entries or >200KB)
-└── RESOURCES/             ← only created when section spills
+```text
+/tmp/ipa-review/com.example.app_1.0_2.0/
 ```
 
-Inside the main report, each per-binary diff is wrapped in a collapsible `<details>` block (path shown as the summary line) so the file is navigable instead of one long scroll. Large sections (>25 updated entries or >200KB rendered) instead spill into the per-section subdirectories listed above.
-
-### Flags
+## Flags
 
 | Flag | Default | Description |
 | ---- | ------- | ----------- |
-| `-t, --title` | auto | Document title; defaults to `<bundleID> <oldVer> .vs <newVer>` |
-| `-o, --output` | `./ipa-diffs` | Outer output directory. Inner folder is always `<bundleID>_<oldVer>_<newVer>` |
+| `-t, --title` | auto | Report title |
+| `-o, --output` | `./ipa-diffs` | Outer output directory |
 | `--no-strs` | false | Skip cstring diffs |
-| `--no-starts` | false | Skip function-starts size deltas |
-| `--no-ent` | false | Skip entitlements diff |
-| `--no-objc` | false | Skip Obj-C metadata diff |
-| `--no-swift` | false | Skip Swift metadata diff |
+| `--no-starts` | false | Skip function-start size deltas |
+| `--no-ent` | false | Skip entitlement diffs |
+| `--no-objc` | false | Skip Obj-C metadata diffs |
+| `--no-swift` | false | Skip Swift metadata diffs |
 | `--skip-resources` | false | Skip text-resource diffs |
-| `--allow-list` | _none_ | Mach-O sections to include (e.g. `__TEXT.__text`) |
-| `--block-list` | _none_ | Mach-O sections to exclude |
-| `-v, --verbose` | false | Verbose logging (per-binary progress) |
+| `--allow-list` | none | Mach-O sections to include, for example `__TEXT.__text` |
+| `--block-list` | none | Mach-O sections to exclude |
+| `--workers` | `GOMAXPROCS` | Parallel workers for per-binary and per-file phases |
+| `-v, --verbose` | false | Verbose logging |
 
-## FairPlay-encrypted IPAs
+## Output Layout
 
-Store-purchased IPAs have their main binary encrypted with FairPlay DRM. `ipadiff` detects encryption (`LC_ENCRYPTION_INFO.CryptID != 0`) and degrades gracefully:
+```text
+<outer>/<bundleID>_<oldVersion>_<newVersion>/
+├── README.md
+├── <BundleName>.md
+├── MACHOS/
+├── HERMES/
+│   └── main_jsbundle/
+│       ├── README.md
+│       ├── manifest.json
+│       ├── artifacts/hermes/diff.json
+│       └── functions/
+├── PLISTS/
+└── RESOURCES/
+```
 
-- Encrypted binaries get a **structural diff only** (sections, imports). Symbols, cstrings, Obj-C, and Swift are skipped — those bytes aren't readable.
-- Plists, entitlements, provisioning, resources, and the file tree are unaffected and still diff cleanly.
+Only sections with content are written. Large sections spill into their own directories and are linked from the top-level report.
 
-For full binary insight, supply decrypted IPAs. Frameworks shipped inside an App Store IPA are usually unencrypted anyway.
+## Hermes Support
 
-## Library use
+Hermes support is automatic.
+
+If the IPA contains changed React Native Hermes bytecode, `ipadiff` runs `hermes-diff` and writes a `HERMES/` report. No Hermes-specific CLI flags are needed.
+
+Hermes detection is based on the bytecode magic:
+
+```text
+c6 1f bc 03 c1 03 19 1f
+```
+
+Tool lookup order:
+
+```text
+1. explicit config path
+2. IPADIFF_HERMES_TOOL
+3. hermes-diff next to the running ipadiff binary
+4. hermes-diff on PATH
+```
+
+Plain JavaScript bundles that are not Hermes bytecode stay in the normal resource diff path.
+
+## FairPlay Encrypted IPAs
+
+Store IPAs may contain FairPlay-encrypted main binaries.
+
+When a binary is encrypted, `ipadiff` keeps the report usable:
+
+- structural Mach-O data is still compared
+- imports and sections are still listed where readable
+- symbols, cstrings, Obj-C, and Swift metadata may be skipped
+- plists, entitlements, provisioning profiles, resources, Hermes bundles, and file-tree diffs still run
+
+Use decrypted IPAs when full binary-level detail is needed.
+
+## Library Use
 
 ```go
-import "github.com/Xplo8E/ipadiff/pkg/ipadiff"
+package main
 
-cfg := &ipadiff.Config{OldIPA: "a.ipa", NewIPA: "b.ipa"}
-cfg.Defaults()
-d, err := ipadiff.Run(cfg)
-// inspect d.Machos, d.Plists, d.Ents, ...
-_ = d.Markdown(os.Stdout) // writes to cfg.Output dir; arg is ignored when Output is set
+import (
+	"os"
+
+	"github.com/Xplo8E/ipadiff/pkg/ipadiff"
+)
+
+func main() {
+	cfg := &ipadiff.Config{
+		OldIPA:     "old.ipa",
+		NewIPA:     "new.ipa",
+		Output:     "ipa-diffs",
+		// Required only when you want Hermes bytecode reports from package use.
+		// If omitted and Hermes changes exist, the run continues with a warning.
+		HermesTool: "bin/hermes-diff",
+	}
+	cfg.Defaults()
+
+	d, err := ipadiff.Run(cfg)
+	if err != nil {
+		panic(err)
+	}
+	defer d.Close()
+
+	_ = d.WriteMarkdown(os.Stdout)
+	_ = d.WriteFiles(cfg.Output)
+}
 ```
 
-## Layout
+## Project Layout
 
+```text
+cmd/ipadiff/          CLI entrypoint
+pkg/ipadiff/          public Go API
+internal/bundle/      IPA extraction, bundle metadata, file classification
+internal/parsers/     plist, mobileprovision, entitlement readers
+internal/diff/        diff engine, sidecar orchestration, Markdown renderer
+internal/vendored/    pruned MIT-licensed code from blacktop/ipsw
+tools/hermes-diff/    Rust Hermes bytecode diff sidecar
 ```
-cmd/ipadiff/          CLI (cobra root)
-internal/
-  bundle/              unzip IPA, classify files, detect FairPlay
-  parsers/             plist, mobileprovision, entitlements readers
-  diff/                orchestrator + per-section diffs + Markdown renderer
-  vendored/            pruned MIT-licensed code from blacktop/ipsw
-    ipsw_macho/        DiffInfo + ObjC/Swift dump
-    ipsw_ent/          DiffDatabases
-    ipsw_entitlements/ DER decode
-    ipsw_utils/        Difference, SanitizeArchivePath, GitDiff
-pkg/ipadiff/           public library entry
+
+## Development
+
+```bash
+make test
+make build
+git diff --check
+```
+
+Useful real-run shape:
+
+```bash
+./bin/ipadiff old.ipa new.ipa -o /tmp/ipadiff-check --workers 4
 ```
 
 ## Credits
 
-The Mach-O DiffInfo engine, entitlement diff, and `git diff` fallback logic
-are vendored from [blacktop/ipsw](https://github.com/blacktop/ipsw)
-(MIT). See `NOTICE` for the pinned upstream commit and the vendor map.
+- Inspired by [`blacktop/ipsw`](https://github.com/blacktop/ipsw).
+- Mach-O diff, entitlement diff, and diff utility code are vendored from [`blacktop/ipsw`](https://github.com/blacktop/ipsw) under the MIT license. See [`NOTICE`](./NOTICE).
+- Hermes bytecode parsing uses [`hermes_rs`](https://github.com/Pilfer/hermes_rs).
+- Hermes JavaScript decompilation uses [`hermes-decomp`](https://github.com/SymbioticSec/hermes-decomp).
 
 ## License
 
-MIT — see `LICENSE`.
+MIT. See [`LICENSE`](./LICENSE).

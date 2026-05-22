@@ -12,6 +12,7 @@ type Kind int
 const (
 	KindUnknown Kind = iota
 	KindMacho        // Mach-O binary (main app, framework, dylib, bundle)
+	KindHermes       // Hermes bytecode bundle (React Native main.jsbundle/.hbc)
 	KindPlist        // any plist (XML or binary), strings, storyboardc, nib, xib
 	KindText         // diffable text (json, js, html, xml, txt, md, css, yaml)
 	KindMedia        // images, audio, video, fonts — skipped at file-tree level
@@ -22,6 +23,8 @@ func (k Kind) String() string {
 	switch k {
 	case KindMacho:
 		return "macho"
+	case KindHermes:
+		return "hermes"
 	case KindPlist:
 		return "plist"
 	case KindText:
@@ -42,11 +45,13 @@ type FileMeta struct {
 	Encrypted bool // true only for Mach-Os with LC_ENCRYPTION_INFO.CryptID != 0
 }
 
+var hermesMagic = []byte{0xc6, 0x1f, 0xbc, 0x03, 0xc1, 0x03, 0x19, 0x1f}
+
 // mediaExts is the suffix set we never diff content for.
 var mediaExts = map[string]struct{}{
 	".png": {}, ".jpg": {}, ".jpeg": {}, ".gif": {}, ".webp": {},
 	".heic": {}, ".heif": {}, ".tiff": {}, ".tif": {}, ".bmp": {},
-	".car":  {}, ".icns": {},
+	".car": {}, ".icns": {},
 	".mp4": {}, ".mov": {}, ".m4v": {}, ".mkv": {}, ".webm": {},
 	".mp3": {}, ".m4a": {}, ".aac": {}, ".wav": {}, ".flac": {}, ".ogg": {},
 	".ttf": {}, ".otf": {}, ".woff": {}, ".woff2": {}, ".eot": {},
@@ -67,7 +72,7 @@ var textExts = map[string]struct{}{
 	".json": {}, ".js": {}, ".jsx": {}, ".ts": {}, ".tsx": {},
 	".html": {}, ".htm": {}, ".xml": {}, ".svg": {},
 	".txt": {}, ".md": {}, ".markdown": {},
-	".css":  {}, ".scss": {}, ".less": {},
+	".css": {}, ".scss": {}, ".less": {},
 	".yaml": {}, ".yml": {}, ".toml": {}, ".ini": {}, ".cfg": {}, ".conf": {},
 	".sh": {}, ".bash": {}, ".zsh": {},
 	".c": {}, ".h": {}, ".m": {}, ".mm": {}, ".swift": {},
@@ -97,11 +102,26 @@ func machoMagic(head []byte) bool {
 	return false
 }
 
+func hermesBytecodeMagic(head []byte) bool {
+	if len(head) < len(hermesMagic) {
+		return false
+	}
+	for i, b := range hermesMagic {
+		if head[i] != b {
+			return false
+		}
+	}
+	return true
+}
+
 // Classify maps (relpath, head-bytes) to a Kind.
 // head should be ~512 bytes from the start of the file when available.
 func Classify(relPath string, head []byte) Kind {
 	if machoMagic(head) {
 		return KindMacho
+	}
+	if hermesBytecodeMagic(head) {
+		return KindHermes
 	}
 	ext := strings.ToLower(filepath.Ext(relPath))
 	if _, ok := mediaExts[ext]; ok {

@@ -12,8 +12,8 @@ import (
 )
 
 func (d *Diff) diffPlists() error {
-	oldMap := collectPlists(d.Old)
-	newMap := collectPlists(d.New)
+	oldMap := d.collectPlists("old", d.Old)
+	newMap := d.collectPlists("new", d.New)
 
 	pd := &PlistDiff{Updated: make(map[string]string)}
 
@@ -27,17 +27,28 @@ func (d *Diff) diffPlists() error {
 
 	common := intersect(oldKeys, newKeys)
 	sort.Strings(common)
-	for _, rel := range common {
+	results := runStringWorkers(common, d.cfg.Workers, func(rel string) plistDiffResult {
 		a := oldMap[rel]
 		b := newMap[rel]
 		if a == b {
-			continue
+			return plistDiffResult{rel: rel}
 		}
 		out, err := vutils.GitDiff(a+"\n", b+"\n", &vutils.GitDiffConfig{Tool: "git"})
 		if err != nil || out == "" {
-			continue
+			if err != nil {
+				return plistDiffResult{rel: rel, warning: "diff failed: " + err.Error()}
+			}
+			return plistDiffResult{rel: rel}
 		}
-		pd.Updated[rel] = fmt.Sprintf("```diff\n%s\n```", out)
+		return plistDiffResult{rel: rel, diff: fmt.Sprintf("```diff\n%s\n```", out)}
+	})
+	for _, result := range results {
+		if result.warning != "" {
+			d.addWarning("plists", result.rel, result.warning)
+		}
+		if result.diff != "" {
+			pd.Updated[result.rel] = result.diff
+		}
 	}
 
 	d.Plists = pd
@@ -48,22 +59,46 @@ func (d *Diff) diffPlists() error {
 // canonicalized-XML strings keyed by bundle-relative path. Files that
 // fail to parse are silently dropped (some "compiled" plists in nested
 // .storyboardc directories aren't actually plists).
-func collectPlists(b *bundle.Bundle) map[string]string {
+type plistCollectResult struct {
+	rel     string
+	value   string
+	warning string
+}
+
+type plistDiffResult struct {
+	rel     string
+	diff    string
+	warning string
+}
+
+func (d *Diff) collectPlists(side string, b *bundle.Bundle) map[string]string {
 	out := make(map[string]string)
+	var keys []string
 	for rel, meta := range b.Files {
 		if meta.Kind != bundle.KindPlist {
 			continue
 		}
+		keys = append(keys, rel)
+	}
+	sort.Strings(keys)
+	results := runStringWorkers(keys, d.cfg.Workers, func(rel string) plistCollectResult {
 		full := filepath.Join(b.AppDir, rel)
 		data, err := os.ReadFile(full)
 		if err != nil {
-			continue
+			return plistCollectResult{rel: rel, warning: "read failed: " + err.Error()}
 		}
 		canon, err := parsers.CanonicalizePlist(data)
 		if err != nil {
+			return plistCollectResult{rel: rel, warning: "parse failed: " + err.Error()}
+		}
+		return plistCollectResult{rel: rel, value: string(canon)}
+	})
+	for _, result := range results {
+		if result.warning != "" {
+			d.addWarning("plists", result.rel, side+": "+result.warning)
 			continue
 		}
-		out[rel] = string(canon)
+		out[result.rel] = result.value
 	}
 	return out
 }

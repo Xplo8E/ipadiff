@@ -29,6 +29,7 @@ func main() {
 		skipResources bool
 		allowList     []string
 		blockList     []string
+		workers       int
 		verbose       bool
 	)
 
@@ -66,6 +67,7 @@ func main() {
 				SkipResources: skipResources,
 				AllowList:     allowList,
 				BlockList:     blockList,
+				Workers:       workers,
 				Verbose:       verbose,
 			}
 			cfg.Defaults()
@@ -114,6 +116,7 @@ func main() {
 	f.BoolVar(&skipResources, "skip-resources", false, "Skip text-resource diffs")
 	f.StringSliceVar(&allowList, "allow-list", nil, "Mach-O sections to include (e.g. __TEXT.__text)")
 	f.StringSliceVar(&blockList, "block-list", nil, "Mach-O sections to exclude")
+	f.IntVar(&workers, "workers", 0, "Parallel workers for per-binary and per-file diff phases (default: GOMAXPROCS)")
 	f.BoolVarP(&verbose, "verbose", "v", false, "Verbose logging")
 
 	if err := root.Execute(); err != nil {

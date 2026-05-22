@@ -1,5 +1,6 @@
 # build output
 /bin/
+/tools/hermes-diff/target/
 
 # local diff output (the default ipadiff output dir)
 /ipa-diffs/

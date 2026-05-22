@@ -14,8 +14,8 @@ import (
 // both sides, extracts the inner XML plist, canonicalizes it, and emits a
 // unified diff. Missing-on-both is a no-op.
 func (d *Diff) diffProvisioning() error {
-	a := readProv(d.Old)
-	b := readProv(d.New)
+	a := d.readProv("old", d.Old)
+	b := d.readProv("new", d.New)
 
 	if a == "" && b == "" {
 		return nil
@@ -35,13 +35,14 @@ func (d *Diff) diffProvisioning() error {
 	return nil
 }
 
-func readProv(b *bundle.Bundle) string {
+func (d *Diff) readProv(side string, b *bundle.Bundle) string {
 	path := filepath.Join(b.AppDir, "embedded.mobileprovision")
 	if _, err := os.Stat(path); err != nil {
 		return ""
 	}
 	canon, err := parsers.ReadMobileProvision(path)
 	if err != nil {
+		d.addWarning("provisioning", "embedded.mobileprovision", side+": parse failed: "+err.Error())
 		return ""
 	}
 	return string(canon)

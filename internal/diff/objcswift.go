@@ -1,7 +1,6 @@
 package diff
 
 import (
-	"fmt"
 	"path/filepath"
 	"sort"
 	"strings"
@@ -18,7 +17,7 @@ func (d *Diff) diffObjC() error {
 	if d.cfg.NoObjC {
 		return nil
 	}
-	d.ObjC = diffPerBinary(d.Old, d.New, vmacho.DumpObjC)
+	d.ObjC = d.diffPerBinary("objc", vmacho.DumpObjC)
 	return nil
 }
 
@@ -26,45 +25,72 @@ func (d *Diff) diffSwift() error {
 	if d.cfg.NoSwift {
 		return nil
 	}
-	d.Swift = diffPerBinary(d.Old, d.New, vmacho.DumpSwift)
+	d.Swift = d.diffPerBinary("swift", vmacho.DumpSwift)
 	return nil
 }
 
-// diffPerBinary computes a textual dump for every Mach-O present on
-// BOTH sides, then unified-diffs the two dumps. Returns a map keyed by
+// diffPerBinary computes a textual dump for every Mach-O present on BOTH
+// sides, then unified-diffs the two dumps. Returns a map keyed by
 // bundle-relative path so the renderer can co-locate each binary's
 // metadata with its structural diff. Encrypted binaries are skipped —
 // their ObjC/Swift sections live in encrypted segments. The dumper
 // itself recovers from panics (see vmacho/dump.go) so a single bad
 // binary cannot bring the whole section down.
-func diffPerBinary(oldB, newB *bundle.Bundle, dump func(*macho.File) (string, error)) map[string]string {
-	keys := commonMachoKeys(oldB, newB)
+type metadataDiffResult struct {
+	rel      string
+	diff     string
+	warnings []string
+}
+
+func (d *Diff) diffPerBinary(section string, dump func(*macho.File) (string, error)) map[string]string {
+	keys := commonMachoKeys(d.Old, d.New)
 	sort.Strings(keys)
 
 	out := make(map[string]string)
-	for i, rel := range keys {
+	results := runStringWorkers(keys, d.cfg.Workers, func(rel string) metadataDiffResult {
 		log.WithFields(log.Fields{
 			"binary": rel,
-			"i":      fmt.Sprintf("%d/%d", i+1, len(keys)),
 		}).Debug("dumping")
-		if oldB.Files[rel].Encrypted || newB.Files[rel].Encrypted {
-			continue
+		result := metadataDiffResult{rel: rel}
+		if d.Old.Files[rel].Encrypted || d.New.Files[rel].Encrypted {
+			result.warnings = append(result.warnings, "encrypted binary skipped")
+			return result
 		}
 
-		oldDump, _ := dumpAt(oldB, rel, dump)
-		newDump, _ := dumpAt(newB, rel, dump)
+		oldDump, err := dumpAt(d.Old, rel, dump)
+		if err != nil {
+			result.warnings = append(result.warnings, "old dump failed: "+err.Error())
+			return result
+		}
+		newDump, err := dumpAt(d.New, rel, dump)
+		if err != nil {
+			result.warnings = append(result.warnings, "new dump failed: "+err.Error())
+			return result
+		}
 		if oldDump == "" && newDump == "" {
-			continue
+			return result
 		}
 		if oldDump == newDump {
-			continue
+			return result
 		}
 
 		diff, err := vutils.GitDiff(oldDump+"\n", newDump+"\n", &vutils.GitDiffConfig{Tool: "git"})
 		if err != nil || len(strings.TrimSpace(diff)) == 0 {
-			continue
+			if err != nil {
+				result.warnings = append(result.warnings, "diff failed: "+err.Error())
+			}
+			return result
 		}
-		out[rel] = diff
+		result.diff = diff
+		return result
+	})
+	for _, result := range results {
+		for _, warning := range result.warnings {
+			d.addWarning(section, result.rel, warning)
+		}
+		if result.diff != "" {
+			out[result.rel] = result.diff
+		}
 	}
 	return out
 }

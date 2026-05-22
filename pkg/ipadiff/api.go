@@ -21,6 +21,7 @@ type Diff = diff.Diff
 
 // Run loads both IPAs, populates every section of the Diff, and returns it.
 // Callers can then write Markdown via d.Markdown(w) or inspect fields directly.
+// Call d.Close() when done if you keep the returned Diff.
 func Run(cfg *Config) (*Diff, error) {
 	cfg.Defaults()
 	d := diff.New(cfg)
@@ -30,9 +31,8 @@ func Run(cfg *Config) (*Diff, error) {
 	return d, nil
 }
 
-// RunAndWrite is the one-shot helper: Run + render Markdown to w.
-// When cfg.Output is non-empty, the multi-file layout is written there and
-// w only receives a short notice.
+// RunAndWrite is the one-shot helper: Run + render via d.Markdown(w).
+// When cfg.Output is non-empty, the multi-file layout is written there.
 func RunAndWrite(cfg *Config, w io.Writer) error {
 	d, err := Run(cfg)
 	if err != nil {

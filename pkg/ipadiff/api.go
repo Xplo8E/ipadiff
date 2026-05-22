@@ -11,7 +11,7 @@ import (
 )
 
 // Version is the released ipadiff version. Bump on every tagged release.
-const Version = "1.0.0"
+const Version = "1.0.1"
 
 // Config is re-exported for library convenience.
 type Config = diff.Config

@@ -6,14 +6,22 @@ import (
 	"path/filepath"
 	"sort"
 
+	"github.com/apex/log"
+
 	"github.com/Xplo8E/ipadiff/internal/bundle"
 	"github.com/Xplo8E/ipadiff/internal/parsers"
 	vutils "github.com/Xplo8E/ipadiff/internal/vendored/ipsw_utils"
 )
 
 func (d *Diff) diffPlists() error {
-	oldMap := d.collectPlists("old", d.Old)
-	newMap := d.collectPlists("new", d.New)
+	oldMap, oldDropped := d.collectPlists("old", d.Old)
+	newMap, newDropped := d.collectPlists("new", d.New)
+	if keys := oldDropped.keys + newDropped.keys; keys > 0 {
+		log.WithFields(log.Fields{
+			"keys":   keys,
+			"plists": oldDropped.plists + newDropped.plists,
+		}).Info("suppressed build-metadata keys in plist diff (--keep-build-keys to show)")
+	}
 
 	pd := &PlistDiff{Updated: make(map[string]string)}
 
@@ -56,13 +64,16 @@ func (d *Diff) diffPlists() error {
 }
 
 // collectPlists reads every KindPlist file in the bundle and returns
-// canonicalized-XML strings keyed by bundle-relative path. Files that
-// fail to parse are silently dropped (some "compiled" plists in nested
-// .storyboardc directories aren't actually plists).
+// canonicalized-XML strings keyed by bundle-relative path. A file that fails
+// to parse is dropped from the map and recorded as a per-file warning (see the
+// side+": "+result.warning path below). Compiled NIBArchive .nib/.storyboardc
+// files no longer reach here — Classify routes them to KindBinary — so a parse
+// warning now means a file that genuinely looks like a plist but isn't valid.
 type plistCollectResult struct {
 	rel     string
 	value   string
 	warning string
+	dropped int // build-metadata keys removed from this plist
 }
 
 type plistDiffResult struct {
@@ -71,7 +82,10 @@ type plistDiffResult struct {
 	warning string
 }
 
-func (d *Diff) collectPlists(side string, b *bundle.Bundle) map[string]string {
+// dropStat tallies build-metadata keys suppressed during plist collection.
+type dropStat struct{ keys, plists int }
+
+func (d *Diff) collectPlists(side string, b *bundle.Bundle) (map[string]string, dropStat) {
 	out := make(map[string]string)
 	var keys []string
 	for rel, meta := range b.Files {
@@ -87,20 +101,29 @@ func (d *Diff) collectPlists(side string, b *bundle.Bundle) map[string]string {
 		if err != nil {
 			return plistCollectResult{rel: rel, warning: "read failed: " + err.Error()}
 		}
-		canon, err := parsers.CanonicalizePlist(data)
+		canon, dropped, err := parsers.CanonicalizePlistDropBuild(data)
+		if d.cfg.KeepBuildKeys {
+			canon, err = parsers.CanonicalizePlist(data)
+			dropped = 0
+		}
 		if err != nil {
 			return plistCollectResult{rel: rel, warning: "parse failed: " + err.Error()}
 		}
-		return plistCollectResult{rel: rel, value: string(canon)}
+		return plistCollectResult{rel: rel, value: string(canon), dropped: dropped}
 	})
+	var stat dropStat
 	for _, result := range results {
 		if result.warning != "" {
 			d.addWarning("plists", result.rel, side+": "+result.warning)
 			continue
 		}
+		if result.dropped > 0 {
+			stat.keys += result.dropped
+			stat.plists++
+		}
 		out[result.rel] = result.value
 	}
-	return out
+	return out, stat
 }
 
 func keysOf(m map[string]string) []string {

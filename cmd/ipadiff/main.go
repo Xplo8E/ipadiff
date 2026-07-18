@@ -27,6 +27,7 @@ func main() {
 		noObjC        bool
 		noSwift       bool
 		skipResources bool
+		keepBuildKeys bool
 		allowList     []string
 		blockList     []string
 		workers       int
@@ -65,6 +66,7 @@ func main() {
 				NoObjC:        noObjC,
 				NoSwift:       noSwift,
 				SkipResources: skipResources,
+				KeepBuildKeys: keepBuildKeys,
 				AllowList:     allowList,
 				BlockList:     blockList,
 				Workers:       workers,
@@ -114,6 +116,7 @@ func main() {
 	f.BoolVar(&noObjC, "no-objc", false, "Skip Obj-C metadata diff")
 	f.BoolVar(&noSwift, "no-swift", false, "Skip Swift metadata diff")
 	f.BoolVar(&skipResources, "skip-resources", false, "Skip text-resource diffs")
+	f.BoolVar(&keepBuildKeys, "keep-build-keys", false, "Keep Xcode/toolchain build-metadata keys (DTXcode, DTSDKBuild, ...) in plist diffs (default: suppressed)")
 	f.StringSliceVar(&allowList, "allow-list", nil, "Mach-O sections to include (e.g. __TEXT.__text)")
 	f.StringSliceVar(&blockList, "block-list", nil, "Mach-O sections to exclude")
 	f.IntVar(&workers, "workers", 0, "Parallel workers for per-binary and per-file diff phases (default: GOMAXPROCS)")

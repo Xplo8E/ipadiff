@@ -27,6 +27,7 @@ type Config struct {
 	NoObjC        bool
 	NoSwift       bool
 	SkipResources bool
+	KeepBuildKeys bool // keep Xcode/toolchain build-metadata keys in plist diffs
 
 	AllowList []string // glob filter on Mach-O section names (Seg.Section)
 	BlockList []string

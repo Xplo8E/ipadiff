@@ -152,7 +152,7 @@ func TestCollectPlists_AddsParseWarning(t *testing.T) {
 		t.Fatal(err)
 	}
 	d := &Diff{cfg: &Config{Workers: 4}}
-	got := d.collectPlists("old", &bundle.Bundle{
+	got, _ := d.collectPlists("old", &bundle.Bundle{
 		AppDir: dir,
 		Files: map[string]bundle.FileMeta{
 			"Broken.plist": {Kind: bundle.KindPlist},

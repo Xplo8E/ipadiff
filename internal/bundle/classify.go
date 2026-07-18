@@ -1,6 +1,7 @@
 package bundle
 
 import (
+	"bytes"
 	"path/filepath"
 	"strings"
 	"unicode/utf8"
@@ -46,6 +47,13 @@ type FileMeta struct {
 }
 
 var hermesMagic = []byte{0xc6, 0x1f, 0xbc, 0x03, 0xc1, 0x03, 0x19, 0x1f}
+
+// nibArchiveMagic is the header of Apple's compiled NIBArchive format. Modern
+// Xcode compiles .nib/.storyboardc files to this (not a plist), so go-plist
+// can't parse them. They're derived build artifacts, not diffable source —
+// route them to size-only. Older nibs are binary plists (bplist00) and stay
+// KindPlist.
+var nibArchiveMagic = []byte("NIBArchive")
 
 // mediaExts is the suffix set we never diff content for.
 var mediaExts = map[string]struct{}{
@@ -122,6 +130,10 @@ func Classify(relPath string, head []byte) Kind {
 	}
 	if hermesBytecodeMagic(head) {
 		return KindHermes
+	}
+	// Compiled NIBArchive (.nib/.storyboardc) is not a plist — size-only diff.
+	if bytes.HasPrefix(head, nibArchiveMagic) {
+		return KindBinary
 	}
 	ext := strings.ToLower(filepath.Ext(relPath))
 	if _, ok := mediaExts[ext]; ok {

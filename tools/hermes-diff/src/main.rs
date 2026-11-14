@@ -1640,13 +1640,24 @@ fn write_readme(out_dir: &Path, manifest: &Manifest) -> Result<()> {
         format!("- partial: {}", manifest.stats.partial),
         format!("- new: {}", manifest.stats.new),
         format!("- deleted: {}", manifest.stats.deleted),
-        format!(
-            "- js_decompile: enabled={}, success={}, failed={}, panicked={}",
-            manifest.stats.js_decompile.enabled,
-            manifest.stats.js_decompile.success,
-            manifest.stats.js_decompile.failed,
-            manifest.stats.js_decompile.panicked,
-        ),
+        {
+            let mut js_line = format!(
+                "- js_decompile: enabled={}, ok={}, refused={}, panicked={}",
+                manifest.stats.js_decompile.enabled,
+                manifest.stats.js_decompile.success,
+                manifest.stats.js_decompile.failed,
+                manifest.stats.js_decompile.panicked,
+            );
+            if manifest.stats.js_decompile.failed > 0 {
+                js_line.push_str(
+                    "\n\n> Note: `refused` counts functions the decompiler could not lower \
+                     to IR (async generators and unsupported constructs). The bytecode dump \
+                     (`*.hbc.txt`) is still written for them; no JS is emitted rather than \
+                     wrong JS.",
+                );
+            }
+            js_line
+        },
         String::new(),
         "## Functions".to_string(),
         String::new(),

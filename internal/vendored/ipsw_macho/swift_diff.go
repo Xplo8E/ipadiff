@@ -4,11 +4,12 @@
 // its SwiftConfig (DSC cache, deps, demangle, addrs) are dropped — ipadiff
 // diffs standalone IPA binaries with raw (mangled) names, matching the
 // demangle-off default of the upstream swift-dump --diff command. Parsing is
-// split from entity building so the Type.String() render calls (which hit the
-// go-macho debug print leak, see dump.go) run under renderMu with stdout
-// captured, while the two files' parsing stays parallel. DiffSwift replaces
-// the (s *Swift) Diff method and returns the raw diff body without the
-// "# Swift diff" header and code fence; unchanged groups are filtered.
+// split from entity building because the Type.String() render calls can hit
+// the go-macho debug print leak (see dump.go); callers run the whole metadata
+// phase behind the phase-level stdout capture in internal/diff
+// (swallowStdoutDuring), so no per-call locking is needed here. DiffSwift
+// replaces the (s *Swift) Diff method and returns the raw diff body without
+// the "# Swift diff" header and code fence; unchanged groups are filtered.
 // Original copyright belongs to blacktop; see internal/vendored/LICENSE.ipsw.
 package vmacho
 
@@ -47,8 +48,8 @@ type swiftModel struct {
 }
 
 // swiftRaw holds the parsed-but-unrendered Swift metadata slices. The Get*
-// calls below do not render, so they are print-leak-free and may run outside
-// the renderMu guard.
+// calls below do not render, so they cannot trigger the go-macho debug print
+// leak regardless of the stdout capture state.
 type swiftRaw struct {
 	types        []stypes.Type
 	protocols    []stypes.Protocol
@@ -156,7 +157,9 @@ func swiftAssociatedTypeKey(a stypes.AssociatedType) string {
 }
 
 // buildSwiftModel renders each parsed declaration into an entity. Rendering
-// calls Type.String() etc., so callers must hold renderMu (see dump.go).
+// calls Type.String() etc., which can hit the go-macho debug print leak, so
+// callers must run under the phase-level stdout capture (internal/diff
+// swallowStdoutDuring).
 func buildSwiftModel(raw *swiftRaw) *swiftModel {
 	m := &swiftModel{
 		types:        map[string]*swiftEntity{},
@@ -201,14 +204,10 @@ func DiffSwift(oldM, newM *macho.File) (out string, err error) {
 	}
 
 	// Entity building renders Swift declarations, which can trigger the
-	// go-macho debug print leak; serialize under renderMu with stdout captured.
-	renderMu.Lock()
-	defer renderMu.Unlock()
-	var oldModel, newModel *swiftModel
-	swallowStdout(func() {
-		oldModel = buildSwiftModel(oldRaw)
-		newModel = buildSwiftModel(newRaw)
-	})
+	// go-macho debug print leak; the caller runs this behind the phase-level
+	// stdout capture (internal/diff swallowStdoutDuring).
+	oldModel := buildSwiftModel(oldRaw)
+	newModel := buildSwiftModel(newRaw)
 
 	return joinDiffSections([]string{
 		diffSwiftEntities("Types", oldModel.types, newModel.types),

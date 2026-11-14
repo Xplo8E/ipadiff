@@ -17,7 +17,11 @@ func (d *Diff) diffObjC() error {
 	if d.cfg.NoObjC {
 		return nil
 	}
-	d.ObjC = d.diffPerBinary("objc", vmacho.DiffObjC, vmacho.DumpObjC)
+	// The Swift/ObjC library renderers can leak debug prints to stdout (see
+	// swallowStdoutDuring); run the whole phase behind the capture.
+	d.ObjC = swallowStdoutDuring(func() map[string]string {
+		return d.diffPerBinary("objc", vmacho.DiffObjC, vmacho.DumpObjC)
+	})
 	return nil
 }
 
@@ -25,7 +29,9 @@ func (d *Diff) diffSwift() error {
 	if d.cfg.NoSwift {
 		return nil
 	}
-	d.Swift = d.diffPerBinary("swift", vmacho.DiffSwift, vmacho.DumpSwift)
+	d.Swift = swallowStdoutDuring(func() map[string]string {
+		return d.diffPerBinary("swift", vmacho.DiffSwift, vmacho.DumpSwift)
+	})
 	return nil
 }
 

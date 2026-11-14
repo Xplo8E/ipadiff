@@ -180,6 +180,9 @@ func (d *Diff) collectPlists(side string, b *bundle.Bundle) (map[string]string, 
 		}
 		out[result.rel] = result.value
 	}
+	// Worker completion order is not sorted; intersectLookup binary-searches
+	// these slices, so sort before returning.
+	sort.Strings(raw)
 	return out, stat, raw
 }
 

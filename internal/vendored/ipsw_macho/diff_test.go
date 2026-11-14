@@ -188,3 +188,51 @@ func TestJoinDiffSectionsShapeCheck(t *testing.T) {
 		t.Fatal("all-quiet sections must join to an empty diff")
 	}
 }
+
+func TestVolatileLoadCmdRanges_KeepDeploymentTarget(t *testing.T) {
+	// LC_BUILD_VERSION: platform(8..12) + minos(12..16) are semantic; only
+	// sdk/ntools/tools (16..sz) rotate per Xcode.
+	if got := volatileLoadCmdRanges(types.LC_BUILD_VERSION, 28); len(got) != 1 || got[0] != [2]int{16, 28} {
+		t.Fatalf("LC_BUILD_VERSION ranges = %v, want [{16 28}]", got)
+	}
+	// LC_VERSION_MIN_*: keep the version (deployment target), drop the SDK.
+	if got := volatileLoadCmdRanges(types.LC_VERSION_MIN_IPHONEOS, 16); len(got) != 1 || got[0] != [2]int{12, 16} {
+		t.Fatalf("LC_VERSION_MIN ranges = %v, want [{12 16}]", got)
+	}
+}
+
+func TestFormatUpdatedDiff_LoadCommandOnlyChange(t *testing.T) {
+	mk := func(loadCmdHash string) *DiffInfo {
+		return &DiffInfo{
+			Imports:     []string{"a"},
+			Sections:    []section{{Name: "__TEXT.__text", Size: 10}},
+			Functions:   3,
+			LoadCmdHash: loadCmdHash,
+		}
+	}
+	out, err := FormatUpdatedDiff(mk("deadbeef"), mk("feedface"), &DiffConfig{Markdown: true, DiffTool: "git"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(out, "Load commands changed") {
+		t.Fatalf("load-command-only change must render a marker, got:\n%s", out)
+	}
+}
+
+func TestDiffCounts_RespectsTimestampPolicy(t *testing.T) {
+	// __DATE__ cstrings are the whole string, and compilerBuildTimestampRE
+	// is intentionally anchored: diagnostics containing a timestamp must
+	// stay reportable.
+	old := &DiffInfo{CStrings: []string{"Jan  5 2026"}}
+	next := &DiffInfo{CStrings: []string{"Feb  6 2027"}}
+	// Same policy as the comparison (--ignore-build-timestamps): the only
+	// difference is a collapsed build timestamp, so counts must be zero.
+	_, _, add, del, _ := DiffCounts(old, next, true)
+	if add != 0 || del != 0 {
+		t.Fatalf("ignored timestamps must not count, got +%d/-%d", add, del)
+	}
+	_, _, add, del, _ = DiffCounts(old, next, false)
+	if add != 1 || del != 1 {
+		t.Fatalf("with timestamps reported, got +%d/-%d, want +1/-1", add, del)
+	}
+}

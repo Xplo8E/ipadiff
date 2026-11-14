@@ -800,3 +800,66 @@ func TestDedupeBinaryPages_NoDuplicatesPassesThrough(t *testing.T) {
 		t.Fatalf("unique pages must pass through unchanged, got %#v", out)
 	}
 }
+
+func TestRenderMachoGroupSections_PluginsExcludeFrameworks(t *testing.T) {
+	framework := "Frameworks/Foo.framework/Foo"
+	plugin := "PlugIns/Bar.appex/Bar"
+
+	d := testDiff()
+	d.Old.ExeName = "App"
+	d.New.ExeName = "App"
+	d.Machos = &vmacho.MachoDiff{
+		New:     []string{framework},
+		Removed: []string{plugin},
+		Updated: map[string]string{
+			framework: "fw diff",
+			plugin:    "plugin diff",
+		},
+	}
+	d.ObjC = map[string]string{}
+	d.Swift = map[string]string{}
+
+	var b strings.Builder
+	if err := renderMachoGroupSections(&b, d, &readmeLinks{binaryFiles: map[string]string{
+		framework: "FRAMEWORKS/Foo.md",
+		plugin:    "PLUGINS/Bar.md",
+	}}, ""); err != nil {
+		t.Fatal(err)
+	}
+	out := b.String()
+
+	// Frameworks heading holds only the framework; Plugins only the plugin.
+	if !strings.Contains(out, "## Frameworks\n\n#### 🆕 NEW (1)") ||
+		!strings.Contains(out, "- `"+framework+"`") {
+		t.Fatalf("frameworks section missing the framework:\n%s", out)
+	}
+	if strings.Contains(out, "## Plugins\n\n#### 🆕 NEW") {
+		t.Fatalf("plugins section must not list framework additions:\n%s", out)
+	}
+	pluginsIdx := strings.Index(out, "## Plugins")
+	pluginsPart := out[pluginsIdx:]
+	if !strings.Contains(pluginsPart, plugin) || strings.Contains(pluginsPart, framework) {
+		t.Fatalf("plugins section must list only plugins:\n%s", pluginsPart)
+	}
+}
+
+func TestRenderReadme_StreamedInlinesBinaryDiffs(t *testing.T) {
+	main := "App"
+	d := testDiff()
+	d.Old.ExeName = main
+	d.New.ExeName = main
+	d.Machos = &vmacho.MachoDiff{Updated: map[string]string{main: "```diff\n- old\n+ new\n```"}}
+	d.ObjC = map[string]string{main: "+ someClass"}
+	d.Swift = map[string]string{}
+
+	out, err := renderReadme(d, nil, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(out, "<details>\n<summary><code>App</code></summary>") {
+		t.Fatalf("streamed README must inline the binary diff body:\n%s", out)
+	}
+	if !strings.Contains(out, "- old\n+ new") || !strings.Contains(out, "+ someClass") {
+		t.Fatalf("streamed README lost the diff bodies:\n%s", out)
+	}
+}

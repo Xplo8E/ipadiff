@@ -54,9 +54,20 @@ func newObjcModel(f *macho.File) (*objcModel, error) {
 		return nil, fmt.Errorf("failed to get ObjC categories: %w", err)
 	}
 	for i := range cats {
-		m.categories[cats[i].Name] = &cats[i]
+		// Categories are keyed by owner class + name: the same category name
+		// can legally exist on different classes, and a name-only key would
+		// overwrite one of them before comparison.
+		m.categories[categoryKey(&cats[i])] = &cats[i]
 	}
 	return m, nil
+}
+
+// categoryKey identifies a category by its owner class and name.
+func categoryKey(c *objc.Category) string {
+	if c.Class != nil && c.Class.Name != "" {
+		return c.Class.Name + "(" + c.Name + ")"
+	}
+	return c.Name
 }
 
 // DiffObjC structurally compares the ObjC metadata of newM against oldM:
@@ -78,23 +89,30 @@ func DiffObjC(oldM, newM *macho.File) (out string, err error) {
 	if err != nil {
 		return "", err
 	}
+	return diffObjCModels(oldModel, newModel), nil
+}
 
+// diffObjCModels renders the structural diff between two already-built ObjC
+// models — the seam unit tests exercise without Mach-O fixtures.
+func diffObjCModels(oldModel, newModel *objcModel) string {
 	return joinDiffSections([]string{
 		diffClasses(oldModel.classes, newModel.classes),
 		diffProtocols(oldModel.protocols, newModel.protocols),
 		diffCategories(oldModel.categories, newModel.categories),
-	}), nil
+	})
 }
 
-// methodKeys returns selector keys for instance ("-") and class ("+") methods,
-// matching ObjC method notation.
+// methodKeys returns keys for instance ("-") and class ("+") methods,
+// matching ObjC method notation and carrying the type encoding so a method
+// that keeps its selector but changes its encoded signature still shows as a
+// changed member.
 func methodKeys(instance, class []objc.Method) map[string]struct{} {
 	keys := make(map[string]struct{}, len(instance)+len(class))
 	for _, m := range instance {
-		keys["-"+m.Name] = struct{}{}
+		keys["-"+m.Name+" "+m.Types] = struct{}{}
 	}
 	for _, m := range class {
-		keys["+"+m.Name] = struct{}{}
+		keys["+"+m.Name+" "+m.Types] = struct{}{}
 	}
 	return keys
 }
@@ -158,6 +176,15 @@ func diffClasses(prev, next map[string]*objc.Class) string {
 			for k := range propertyKeys(c.Props, "-") {
 				keys[k] = struct{}{}
 			}
+			// Superclass and ivars participate in existing-class comparison:
+			// a class that changes inheritance or instance storage with an
+			// unchanged method set must still report as changed.
+			if c.SuperClass != "" {
+				keys[fmt.Sprintf("extends %s", c.SuperClass)] = struct{}{}
+			}
+			for _, iv := range c.Ivars {
+				keys[fmt.Sprintf("@ivar %s %s", iv.Name, iv.Type)] = struct{}{}
+			}
 			return keys
 		},
 		func(c *objc.Class) string {
@@ -195,5 +222,5 @@ func diffCategories(prev, next map[string]*objc.Category) string {
 			}
 			return keys
 		},
-		func(c *objc.Category) string { return c.Name })
+		func(c *objc.Category) string { return categoryKey(c) })
 }

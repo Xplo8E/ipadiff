@@ -705,6 +705,7 @@ func renderMainBinarySection(b *strings.Builder, d *Diff, links *readmeLinks) {
 		return
 	}
 	fmt.Fprintf(b, "#### ⬆️ Updated (1)\n\n- `%s`\n\n", mainExe)
+	renderInlineBinaryDiffs(b, d, []string{mainExe})
 }
 
 // renderMachoGroupSections renders the Frameworks and Plugins groups as
@@ -726,7 +727,9 @@ func renderMachoGroupSections(b *strings.Builder, d *Diff, links *readmeLinks, r
 		{"## Frameworks", func(rel string) bool {
 			return strings.HasPrefix(rel, "Frameworks"+string(filepath.Separator))
 		}, "FRAMEWORKS", "Frameworks"},
-		{"## Plugins", func(rel string) bool { return true }, "PLUGINS", "Plugins"},
+		{"## Plugins", func(rel string) bool {
+			return !strings.HasPrefix(rel, "Frameworks"+string(filepath.Separator))
+		}, "PLUGINS", "Plugins"},
 	}
 	for _, g := range groups {
 		var newL, rmL, upL []listLine
@@ -740,6 +743,7 @@ func renderMachoGroupSections(b *strings.Builder, d *Diff, links *readmeLinks, r
 				rmL = append(rmL, listLine{text: rel})
 			}
 		}
+		var upRels []string
 		for rel := range d.Machos.Updated {
 			if rel != mainExe && g.match(rel) {
 				href := ""
@@ -747,6 +751,7 @@ func renderMachoGroupSections(b *strings.Builder, d *Diff, links *readmeLinks, r
 					href = links.binaryFiles[rel]
 				}
 				upL = append(upL, listLine{text: rel, href: href})
+				upRels = append(upRels, rel)
 			}
 		}
 		sortListLines(newL)
@@ -759,8 +764,43 @@ func renderMachoGroupSections(b *strings.Builder, d *Diff, links *readmeLinks, r
 		if err := renderDiffTriple(b, "####", newL, rmL, upL, root, g.subDir, g.label); err != nil {
 			return err
 		}
+		if links == nil {
+			// Streamed report: there are no side-car pages to link to, so the
+			// diff bodies render inline (collapsed) instead of being lost.
+			renderInlineBinaryDiffs(b, d, upRels)
+		}
 	}
 	return nil
+}
+
+// renderInlineBinaryDiffs emits one collapsed block per binary holding the
+// structural diff plus the Obj-C and Swift sections — the streamed-report
+// equivalent of the per-binary pages.
+func renderInlineBinaryDiffs(b *strings.Builder, d *Diff, rels []string) {
+	for _, rel := range rels {
+		structural := d.Machos.Updated[rel]
+		objc := d.ObjC[rel]
+		swift := d.Swift[rel]
+		if structural == "" && objc == "" && swift == "" {
+			continue
+		}
+		fmt.Fprintf(b, "<details>\n<summary><code>%s</code></summary>\n\n", rel)
+		if structural != "" {
+			b.WriteString(structural)
+			b.WriteString("\n")
+		}
+		if objc != "" {
+			b.WriteString("#### Obj-C\n\n```diff\n")
+			b.WriteString(objc)
+			b.WriteString("\n```\n\n")
+		}
+		if swift != "" {
+			b.WriteString("#### Swift\n\n```diff\n")
+			b.WriteString(swift)
+			b.WriteString("\n```\n\n")
+		}
+		b.WriteString("</details>\n\n")
+	}
 }
 
 func renderPlistsSection(b *strings.Builder, d *Diff, links *readmeLinks, root string) error {
@@ -977,6 +1017,7 @@ func renderChangeSurface(d *Diff, links *readmeLinks) string {
 	}
 	sort.Strings(rels)
 
+	ignoreTimestamps := d.cfg != nil && d.cfg.IgnoreBuildTimestamps
 	var rows []row
 	for _, rel := range rels {
 		r := row{rel: rel}
@@ -986,7 +1027,7 @@ func renderChangeSurface(d *Diff, links *readmeLinks) string {
 		case d.oldInfos[rel] != nil && d.newInfos[rel] == nil:
 			r.newOrRemoved = "removed"
 		default:
-			r.symAdd, r.symDel, r.csAdd, r.csDel, r.funcDelta = vmacho.DiffCounts(d.oldInfos[rel], d.newInfos[rel])
+			r.symAdd, r.symDel, r.csAdd, r.csDel, r.funcDelta = vmacho.DiffCounts(d.oldInfos[rel], d.newInfos[rel], ignoreTimestamps)
 		}
 		_, r.macho = d.Machos.Updated[rel]
 		r.objc = d.ObjC[rel] != ""

@@ -155,7 +155,11 @@ func collapseBuildNumbers(value string) string {
 // date tokens, and bare numeric build-number components.
 // ipadiff extension over upstream: the CI date/number passes — ipsw only
 // diffs Apple binaries, ipadiff diffs vendor apps whose CI roots rotate in
-// vendor-specific layouts.
+// vendor-specific layouts. Accepted trade-off: a non-CI path that happens to
+// carry a date-like or ≥6-digit numeric component collapses too, so a change
+// confined to that component is masked; corpus evidence (269 real churn
+// pairs canceled on arattai, zero false collapses) weighed for generality
+// over per-vendor root lists.
 func normalizeBuildPathForDiff(value string) string {
 	// Every pattern below is rooted at a '/', so a value without one cannot
 	// match any of them. The gate matters because this runs over every symbol
@@ -457,6 +461,16 @@ func FormatUpdatedDiff(oldInfo, newInfo *DiffInfo, conf *DiffConfig) (string, er
 				b.WriteString(fmt.Sprintf("- %#v\n", s))
 			}
 		}
+	}
+
+	// Load commands: the digest covers commands the size/section view cannot
+	// see (LC_RPATH, entry point, segment flags, deployment target). A
+	// digest-only change would otherwise format as empty and be dropped by
+	// MachoDiff.Generate, silently hiding a real binary change.
+	if !conf.IgnoreLoadCommands &&
+		oldInfo.LoadCmdHash != "" && newInfo.LoadCmdHash != "" &&
+		oldInfo.LoadCmdHash != newInfo.LoadCmdHash {
+		b.WriteString("Load commands changed (rpath / entry point / segment flags — no section size change):\n")
 	}
 
 	if b.Len() == 0 && len(sectionChanges) == 0 {
@@ -837,10 +851,15 @@ func volatileLoadCmdRanges(cmd types.LoadCmd, sz int) [][2]int {
 	case types.LC_SOURCE_VERSION:
 		return [][2]int{{8, 16}} // version uint64
 	case types.LC_BUILD_VERSION:
-		return [][2]int{{12, sz}} // keep platform; drop minos/sdk/ntools/tools
+		// Keep platform and minos (the deployment target is a semantic field
+		// the plist diff also preserves via MinimumOSVersion); drop
+		// sdk/ntools/tool entries, which rotate per Xcode.
+		return [][2]int{{16, sz}}
 	case types.LC_VERSION_MIN_MACOSX, types.LC_VERSION_MIN_IPHONEOS,
 		types.LC_VERSION_MIN_TVOS, types.LC_VERSION_MIN_WATCHOS:
-		return [][2]int{{8, 16}} // version + sdk
+		// Same policy: the version field is the deployment target; the SDK
+		// is build metadata.
+		return [][2]int{{12, 16}}
 	case types.LC_LOAD_DYLIB, types.LC_ID_DYLIB, types.LC_LOAD_WEAK_DYLIB,
 		types.LC_REEXPORT_DYLIB, types.LC_LAZY_LOAD_DYLIB, types.LC_LOAD_UPWARD_DYLIB:
 		// Keep name_offset[8:12] and the name string[24:]; drop timestamp +
@@ -1342,11 +1361,13 @@ func NormalizedCounts(i *DiffInfo) (symbols, cstrings int) {
 }
 
 // DiffCounts returns the added/removed set sizes between two infos under the
-// engine's normalization, plus the function-count delta. Safe with nil inputs.
-func DiffCounts(oldI, newI *DiffInfo) (symAdd, symDel, csAdd, csDel, funcDelta int) {
+// engine's normalization, plus the function-count delta. ignoreBuildTimestamps
+// must carry the same policy the comparison used, so summary counts agree with
+// the per-binary diffs. Safe with nil inputs.
+func DiffCounts(oldI, newI *DiffInfo, ignoreBuildTimestamps bool) (symAdd, symDel, csAdd, csDel, funcDelta int) {
 	a, b := diffNormalizedSymbols(infoSymbols(oldI), infoSymbols(newI))
 	symAdd, symDel = len(a), len(b)
-	c, d := diffNormalizedCStrings(infoCStrings(oldI), infoCStrings(newI), false)
+	c, d := diffNormalizedCStrings(infoCStrings(oldI), infoCStrings(newI), ignoreBuildTimestamps)
 	csAdd, csDel = len(c), len(d)
 	funcDelta = infoFunctions(newI) - infoFunctions(oldI)
 	return

@@ -130,7 +130,7 @@ func openMacho(path string) (*macho.File, error) {
 	// Transfer ownership to the returned slice: closing the fat file would
 	// close every slice, so the caller closes the picked slice directly.
 	// (Same trick the pre-1.2 openMacho used for the last arch.)
-	return preferredSlice(path, ms), nil
+	return preferredSlice(ms), nil
 }
 
 // openSlices returns every Mach-O slice in path (a single slice for thin
@@ -156,14 +156,14 @@ func openSlices(path string) ([]*macho.File, func(), error) {
 	return nil, nil, fmt.Errorf("open fat %s: %w", path, err)
 }
 
-// preferredSlice picks the slice whose entitlements and metadata represent a
-// universal binary: ARM64e_X1, then ARM64_X1, then ARM64e, then other ARM64,
-// then any other CPU; equal ranks prefer the larger CPU, then the full
-// subtype (including feature bits). The slice list must be nonempty with
-// unique CPU/subtype pairs, as in a FAT file. A warning is logged when
-// entitlements or launch constraints disagree between slices.
+// preferredSlice picks the slice whose metadata represents a universal
+// binary: ARM64e_X1, then ARM64_X1, then ARM64e, then other ARM64, then any
+// other CPU; equal ranks prefer the larger CPU, then the full subtype
+// (including feature bits). The slice list must be nonempty with unique
+// CPU/subtype pairs, as in a FAT file. Rank selection is side-effect free and
+// does not touch the code signature, so it is safe on hot open paths.
 // Ported from ipsw internal/commands/ent/slices.go (vendored-update).
-func preferredSlice(path string, ms []*macho.File) *macho.File {
+func preferredSlice(ms []*macho.File) *macho.File {
 	best := ms[0]
 	for _, m := range ms[1:] {
 		if cmp.Or(cmp.Compare(sliceRank(m), sliceRank(best)),
@@ -171,6 +171,16 @@ func preferredSlice(path string, ms []*macho.File) *macho.File {
 			best = m
 		}
 	}
+	return best
+}
+
+// preferredEntitlementSlice picks the representative slice for ENTITLEMENT
+// content: same ranking as preferredSlice, plus a warning when slices
+// disagree on entitlements or launch constraints, since rank alone cannot
+// prove the slices carry the same signature payload. Only the entitlement
+// diff path pays the code-signature parse of every slice.
+func preferredEntitlementSlice(path string, ms []*macho.File) *macho.File {
+	best := preferredSlice(ms)
 	want := sliceEntitlements(best)
 	for _, m := range ms {
 		if m != best && sliceEntitlements(m) != want {

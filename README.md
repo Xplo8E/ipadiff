@@ -105,6 +105,7 @@ The inner report directory is still derived from bundle metadata:
 <outer>/<bundleID>_<oldVersion>_<newVersion>/
 ├── README.md
 ├── <BundleName>.md
+├── facts.json
 ├── MACHOS/
 ├── HERMES/
 │   └── main_jsbundle/
@@ -116,7 +117,7 @@ The inner report directory is still derived from bundle metadata:
 └── RESOURCES/
 ```
 
-Only sections with content are written. Large sections spill into their own directories and are linked from the top-level report.
+Only sections with content are written. Large sections spill into their own directories and are linked from the top-level report. `facts.json` is written only with `--facts` and carries machine-readable per-binary comparison facts (policy, section content hashes, load-command digest, entitlements, launch constraints) for both sides, keyed by bundle-relative path.
 
 ## Hermes Support
 

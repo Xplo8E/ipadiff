@@ -34,8 +34,9 @@ func (d *Diff) buildEntDB(side string, b *bundle.Bundle) map[string]string {
 			d.addWarning("entitlements", rel, side+": open Mach-O failed: "+err.Error())
 			continue
 		}
-		// preferredSlice also warns when slices disagree on entitlements.
-		m := preferredSlice(full, ms)
+		// preferredEntitlementSlice also warns when slices disagree on
+		// entitlements or launch constraints.
+		m := preferredEntitlementSlice(full, ms)
 		ent := parsers.ReadFromMacho(m)
 		closeSlices()
 

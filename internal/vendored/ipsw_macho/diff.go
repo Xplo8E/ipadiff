@@ -200,17 +200,6 @@ func mayEndInGeneratedCounter(value string) bool {
 	return ('0' <= last && last <= '9') || strings.HasSuffix(value, ".cold")
 }
 
-func normalizeSymbolsForDiff(values []string) []string {
-	if len(values) == 0 {
-		return nil
-	}
-	normalized := make([]string, len(values))
-	for idx, value := range values {
-		normalized[idx] = normalizeSymbolForDiff(value)
-	}
-	return normalized
-}
-
 // diffNormalizedSymbols returns sorted, deduplicated additions and removals
 // after collapsing build-root paths and generated counters.
 func diffNormalizedSymbols(oldValues, newValues []string) ([]string, []string) {
@@ -241,19 +230,6 @@ func diffNormalizedSets(oldValues, newValues []string, normalize func(string) st
 	sort.Strings(added)
 	sort.Strings(removed)
 	return added, removed
-}
-
-func normalizeCStringsForDiff(values []string, ignoreBuildTimestamps bool) []string {
-	if len(values) == 0 {
-		return nil
-	}
-
-	normalize := cstringNormalizer(ignoreBuildTimestamps)
-	normalized := make([]string, len(values))
-	for idx, value := range values {
-		normalized[idx] = normalize(value)
-	}
-	return normalized
 }
 
 func diffNormalizedCStrings(oldValues, newValues []string, ignoreBuildTimestamps bool) ([]string, []string) {
@@ -1275,8 +1251,12 @@ func (i *DiffInfo) stringForDiff(conf *DiffConfig) string {
 
 // Generate computes New/Removed/Updated across two parallel
 // path->DiffInfo maps. The caller owns extraction; this function only
-// performs the set diff and per-pair formatting.
+// performs the set diff and per-pair formatting. A nil conf is treated as
+// the zero policy.
 func (diff *MachoDiff) Generate(prev, next map[string]*DiffInfo, conf *DiffConfig) error {
+	if conf == nil {
+		conf = &DiffConfig{}
+	}
 	if diff.Updated == nil {
 		diff.Updated = make(map[string]string)
 	}

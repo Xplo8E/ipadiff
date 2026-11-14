@@ -92,12 +92,22 @@ func diffSection[T any](title string, prev, next map[string]*T, members func(*T)
 	return b.String()
 }
 
-// joinDiffSections drops the "no changes" group outputs and joins the rest,
-// returning "" when every group is unchanged.
+// sectionUnchanged reports whether out is diffSection's all-quiet output
+// ("@@ Title: no changes @@\n" and nothing else). Checked by shape rather
+// than substring, so a changed entity whose members merely mention "no
+// changes" cannot suppress a real diff.
+func sectionUnchanged(out string) bool {
+	return strings.HasPrefix(out, "@@ ") &&
+		strings.HasSuffix(out, ": no changes @@\n") &&
+		strings.Count(out, "\n") == 1
+}
+
+// joinDiffSections drops the empty and all-quiet group outputs and joins the
+// rest, returning "" when every group is unchanged. ipadiff addition.
 func joinDiffSections(sections []string) string {
 	var kept []string
 	for _, s := range sections {
-		if s != "" && !strings.Contains(s, ": no changes @@") {
+		if s != "" && !sectionUnchanged(s) {
 			kept = append(kept, s)
 		}
 	}

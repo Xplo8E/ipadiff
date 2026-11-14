@@ -3,7 +3,16 @@ package diff
 import (
 	"io"
 	"os"
+	"sync"
 )
+
+// stdoutMu serializes the process-global stdout capture windows: two library
+// callers running ipadiff.Run concurrently would otherwise each swap
+// os.Stdout and restore their own saved value, racing the variable and
+// potentially leaving it pointed at a closed capture pipe. The lock covers
+// only the capture window, so unrelated work in concurrent runs stays
+// parallel.
+var stdoutMu sync.Mutex
 
 // swallowStdoutDuring runs fn while the process stdout is redirected to a
 // drained pipe. go-macho v1.1.296's Swift type renderer prints stray debug
@@ -19,6 +28,9 @@ import (
 //
 // Remove this wrapper once a go-macho release drops the debug prints.
 func swallowStdoutDuring[T any](fn func() T) T {
+	stdoutMu.Lock()
+	defer stdoutMu.Unlock()
+
 	realStdout := os.Stdout
 	r, w, err := os.Pipe()
 	if err != nil {

@@ -7,6 +7,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"slices"
 	"sort"
 	"strings"
 	"unicode"
@@ -657,6 +658,11 @@ func renderReadme(d *Diff, links *readmeLinks, root string) (string, error) {
 // bare title.
 func (d *Diff) statusNote() string {
 	if d.diffEmpty() {
+		// Skipped comparisons (failed opens/parses) leave warnings behind; an
+		// empty result set with warnings is incomplete, not a clean no-op.
+		if len(d.Warnings) > 0 {
+			return "> No differences found; some comparisons were skipped — see Warnings.\n"
+		}
 		return "> No differences found.\n"
 	}
 	return ""
@@ -692,7 +698,8 @@ func renderMainBinarySection(b *strings.Builder, d *Diff, links *readmeLinks) {
 		mainExe = d.Old.ExeName
 	}
 	b.WriteString("## Main Binary\n\n")
-	if !mainHasContent(d, mainExe) {
+	renamedOrNew := d.Machos != nil && slices.Contains(d.Machos.New, mainExe)
+	if !mainHasContent(d, mainExe) && !renamedOrNew {
 		b.WriteString("- unchanged\n\n")
 		return
 	}
@@ -718,6 +725,10 @@ func renderMachoGroupSections(b *strings.Builder, d *Diff, links *readmeLinks, r
 	if d.Machos == nil {
 		return nil
 	}
+	// A CFBundleExecutable rename puts the old executable in Removed and the
+	// new one in New; both belong to the Main Binary section, never to the
+	// Frameworks/Plugins groups.
+	renamed := d.Old.ExeName != d.New.ExeName && d.Old.ExeName != "" && d.New.ExeName != ""
 	groups := []struct {
 		heading string
 		match   func(rel string) bool
@@ -739,7 +750,7 @@ func renderMachoGroupSections(b *strings.Builder, d *Diff, links *readmeLinks, r
 			}
 		}
 		for _, rel := range d.Machos.Removed {
-			if rel != mainExe && g.match(rel) {
+			if rel != mainExe && !(renamed && rel == d.Old.ExeName) && g.match(rel) {
 				rmL = append(rmL, listLine{text: rel})
 			}
 		}
@@ -907,14 +918,21 @@ func renderHermesSection(b *strings.Builder, d *Diff, links *readmeLinks, root s
 	b.WriteString("## Hermes\n\n")
 	var upL []listLine
 	if len(h.Updated) > 0 {
-		if links != nil && links.hasHermes {
-			upL = []listLine{{text: "bundle diffs", href: filepath.Join("HERMES", "README.md")}}
-		} else {
-			keys := make([]string, 0, len(h.Updated))
-			for k := range h.Updated {
-				keys = append(keys, k)
+		keys := make([]string, 0, len(h.Updated))
+		for k := range h.Updated {
+			keys = append(keys, k)
+		}
+		sort.Strings(keys)
+		for _, rel := range keys {
+			item := h.Updated[rel]
+			// File mode: each bundle's sidecar wrote its own README under
+			// HERMES/<bundle>/; link that page directly. There is no
+			// HERMES/README.md aggregate index.
+			if links != nil && item.OutputDir != "" {
+				upL = append(upL, listLine{text: rel, href: item.OutputDir + "/README.md"})
+			} else {
+				upL = append(upL, listLine{text: rel})
 			}
-			upL = nameLines(keys)
 		}
 	}
 	return renderDiffTriple(b, "####", nameLines(h.New), nameLines(h.Removed), upL, root, "HERMES", "Hermes")
@@ -1279,7 +1297,7 @@ func buildPlistPages(pd *PlistDiff) []plistPage {
 		pages = append(pages, plistPage{
 			displayPath: group.displayPath,
 			body:        renderLocalizedPlistPage(group),
-			dedupeKey:   localizedRepresentativeDiff(group),
+			dedupeKey:   localizedDedupeKey(group),
 		})
 	}
 
@@ -1337,9 +1355,12 @@ func dedupePlistPages(pages []plistPage) []plistPage {
 	return out
 }
 
-// localizedRepresentativeDiff returns the diff of the localized group's
-// representative locale, matching what renderLocalizedPlistPage renders.
-func localizedRepresentativeDiff(group *localizedPlistGroup) string {
+// localizedDedupeKey merges localized family pages only when BOTH the
+// representative diff and the locale set match: the same bundle copied into
+// appexes carries identical locale directories and dedupes, but two bundles
+// whose en diff matches while their locale sets differ keep separate pages —
+// merging them would hide the second family's locale list.
+func localizedDedupeKey(group *localizedPlistGroup) string {
 	paths := mapKeys(group.diffByRel)
 	sort.Slice(paths, func(i, j int) bool {
 		li, lj := group.localeByRel[paths[i]], group.localeByRel[paths[j]]
@@ -1351,7 +1372,12 @@ func localizedRepresentativeDiff(group *localizedPlistGroup) string {
 		}
 		return paths[i] < paths[j]
 	})
-	return group.diffByRel[paths[0]]
+	locales := make([]string, 0, len(paths))
+	for _, rel := range paths {
+		locales = append(locales, group.localeByRel[rel])
+	}
+	sort.Strings(locales)
+	return group.diffByRel[paths[0]] + "\x00" + strings.Join(locales, ",")
 }
 
 // ----- binary page dedupe --------------------------------------------------

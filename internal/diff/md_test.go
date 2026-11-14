@@ -485,8 +485,8 @@ echo "# Hermes" > "$out/README.md"
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !strings.Contains(string(readme), "[bundle diffs](HERMES/README.md)") {
-		t.Fatalf("README missing HERMES link:\n%s", string(readme))
+	if !strings.Contains(string(readme), "[main.jsbundle](HERMES/main_jsbundle/README.md)") {
+		t.Fatalf("README missing per-bundle HERMES link:\n%s", string(readme))
 	}
 	if _, err := os.Stat(filepath.Join(root, "HERMES", "main_jsbundle", "manifest.json")); err != nil {
 		t.Fatalf("missing Hermes manifest: %v", err)

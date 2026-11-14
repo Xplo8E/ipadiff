@@ -469,6 +469,12 @@ echo "# Hermes" > "$out/README.md"
 	d.Hermes = &HermesDiff{Updated: map[string]*HermesBundleDiff{
 		"main.jsbundle": {Path: "main.jsbundle"},
 	}}
+	// Production snapshots the bundles during diffHermes; simulate that so
+	// the sidecar reads private snapshot paths instead of the (already
+	// torn-down) IPA temp dirs.
+	if err := d.Hermes.Updated["main.jsbundle"].snapshotInputs(oldDir, newDir); err != nil {
+		t.Fatal(err)
+	}
 
 	out := t.TempDir()
 	if err := d.WriteFiles(out); err != nil {
@@ -611,6 +617,12 @@ func TestWriteFiles_HermesSidecarTimeout(t *testing.T) {
 	d.Hermes = &HermesDiff{Updated: map[string]*HermesBundleDiff{
 		"main.jsbundle": {Path: "main.jsbundle"},
 	}}
+	// Production snapshots the bundles during diffHermes; simulate that so
+	// the sidecar reads private snapshot paths instead of the (already
+	// torn-down) IPA temp dirs.
+	if err := d.Hermes.Updated["main.jsbundle"].snapshotInputs(oldDir, newDir); err != nil {
+		t.Fatal(err)
+	}
 
 	if err := d.WriteFiles(t.TempDir()); err != nil {
 		t.Fatal(err)

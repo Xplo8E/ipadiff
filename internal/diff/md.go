@@ -580,7 +580,135 @@ func renderStats(b *strings.Builder, d *Diff, links *readmeLinks) {
 			len(d.Hermes.New), len(d.Hermes.Removed), len(d.Hermes.Updated), suffix)
 	}
 
+	// Plist raw-text fallback, as one line instead of per-file warnings.
+	if d.Plists != nil && len(d.Plists.Raw) > 0 {
+		fmt.Fprintf(b, "- **Raw-text plists** — %d compared as raw bytes (plist canonicalization failed; identical files are silent)\n", len(d.Plists.Raw))
+	}
+
+	if table := renderChangeSurface(d, links); table != "" {
+		b.WriteString("\n### Change Surface\n\n")
+		b.WriteString(table)
+	}
+
 	b.WriteString("\n")
+}
+
+// renderChangeSurface renders one row per binary whose comparison changed,
+// sorted by how much moved, so a reader sees WHERE the release changed
+// before opening any per-binary page. Counts are the normalized set deltas
+// the diff engine compares (build-path/counter noise already collapsed).
+func renderChangeSurface(d *Diff, links *readmeLinks) string {
+	type row struct {
+		rel                string
+		symAdd, symDel     int
+		csAdd, csDel       int
+		funcDelta          int
+		objc, swift, macho bool
+		newOrRemoved       string
+	}
+
+	seen := make(map[string]struct{})
+	var rels []string
+	collect := func(m map[string]*vmacho.DiffInfo) {
+		for rel := range m {
+			if _, ok := seen[rel]; !ok {
+				seen[rel] = struct{}{}
+				rels = append(rels, rel)
+			}
+		}
+	}
+	collect(d.oldInfos)
+	collect(d.newInfos)
+	for rel := range d.ObjC {
+		if _, ok := seen[rel]; !ok {
+			seen[rel] = struct{}{}
+			rels = append(rels, rel)
+		}
+	}
+	for rel := range d.Swift {
+		if _, ok := seen[rel]; !ok {
+			seen[rel] = struct{}{}
+			rels = append(rels, rel)
+		}
+	}
+	sort.Strings(rels)
+
+	var rows []row
+	for _, rel := range rels {
+		r := row{rel: rel}
+		switch {
+		case d.oldInfos[rel] == nil && d.newInfos[rel] != nil:
+			r.newOrRemoved = "new"
+		case d.oldInfos[rel] != nil && d.newInfos[rel] == nil:
+			r.newOrRemoved = "removed"
+		default:
+			r.symAdd, r.symDel, r.csAdd, r.csDel, r.funcDelta = vmacho.DiffCounts(d.oldInfos[rel], d.newInfos[rel])
+		}
+		_, r.macho = d.Machos.Updated[rel]
+		r.objc = d.ObjC[rel] != ""
+		r.swift = d.Swift[rel] != ""
+		if r.newOrRemoved == "" && !r.macho && !r.objc && !r.swift &&
+			r.symAdd == 0 && r.symDel == 0 && r.csAdd == 0 && r.csDel == 0 && r.funcDelta == 0 {
+			continue
+		}
+		rows = append(rows, r)
+	}
+	if len(rows) == 0 {
+		return ""
+	}
+
+	// Loudest first: total moved entries, then binary name for stability.
+	sort.Slice(rows, func(i, j int) bool {
+		ti := abs(rows[i].symAdd+rows[i].symDel+rows[i].csAdd+rows[i].csDel) + abs(rows[i].funcDelta)
+		tj := abs(rows[j].symAdd+rows[j].symDel+rows[j].csAdd+rows[j].csDel) + abs(rows[j].funcDelta)
+		if ti != tj {
+			return ti > tj
+		}
+		return rows[i].rel < rows[j].rel
+	})
+
+	var b strings.Builder
+	b.WriteString("| Binary | Symbols | Strings | Functions | Obj-C | Swift | Structural |\n")
+	b.WriteString("| :-- | :-- | :-- | :-- | :-- | :-- | :-- |\n")
+	for _, r := range rows {
+		name := r.rel
+		if links != nil {
+			if file := links.binaryFiles[r.rel]; file != "" {
+				name = fmt.Sprintf("[%s](./%s)", r.rel, file)
+			}
+		}
+		sym := "—"
+		if r.newOrRemoved != "" {
+			sym = r.newOrRemoved
+		} else if r.symAdd+r.symDel > 0 {
+			sym = fmt.Sprintf("+%d / −%d", r.symAdd, r.symDel)
+		}
+		strs := "—"
+		if r.csAdd+r.csDel > 0 {
+			strs = fmt.Sprintf("+%d / −%d", r.csAdd, r.csDel)
+		}
+		fns := "—"
+		if r.funcDelta != 0 {
+			fns = fmt.Sprintf("%+d", r.funcDelta)
+		}
+		yesNo := func(v bool) string {
+			if v {
+				return "changed"
+			}
+			return "—"
+		}
+		fmt.Fprintf(&b, "| %s | %s | %s | %s | %s | %s | %s |\n",
+			name, sym, strs, fns, yesNo(r.objc), yesNo(r.swift), yesNo(r.macho))
+	}
+	b.WriteString("\n")
+	return b.String()
+}
+
+func abs(n int) int {
+	if n < 0 {
+		return -n
+	}
+	return n
 }
 
 // mainHasContent reports whether the main app binary has any updated
@@ -764,6 +892,11 @@ func renderResourceIndex(r *ResourcesDiff, pages []resourcePage) string {
 type plistPage struct {
 	displayPath string
 	body        string
+	// dedupeKey identifies the diff content of the page: pages that share a
+	// key show the same change (bundles replicated across appexes) and are
+	// merged by dedupePlistPages. Empty means "dedupe on the body minus the
+	// title line".
+	dedupeKey string
 }
 
 type localizedPlistGroup struct {
@@ -813,6 +946,7 @@ func buildPlistPages(pd *PlistDiff) []plistPage {
 			pages = append(pages, plistPage{
 				displayPath: rel,
 				body:        fmt.Sprintf("# %s\n\n%s\n", rel, diff),
+				dedupeKey:   diff,
 			})
 			continue
 		}
@@ -841,6 +975,7 @@ func buildPlistPages(pd *PlistDiff) []plistPage {
 				pages = append(pages, plistPage{
 					displayPath: rel,
 					body:        fmt.Sprintf("# %s\n\n%s\n", rel, diff),
+					dedupeKey:   diff,
 				})
 			}
 			continue
@@ -848,13 +983,94 @@ func buildPlistPages(pd *PlistDiff) []plistPage {
 		pages = append(pages, plistPage{
 			displayPath: group.displayPath,
 			body:        renderLocalizedPlistPage(group),
+			dedupeKey:   localizedRepresentativeDiff(group),
 		})
 	}
 
 	sort.Slice(pages, func(i, j int) bool {
 		return pages[i].displayPath < pages[j].displayPath
 	})
-	return pages
+	return dedupePlistPages(pages)
+}
+
+// dedupePlistPages merges pages whose diff content is identical: bundles
+// replicated across appexes (the same momd, localization bundle, or framework
+// copied into every extension) otherwise render the same diff once per copy.
+// The alphabetically first path becomes the representative; the rest are
+// listed under a "Same diff in" note.
+func dedupePlistPages(pages []plistPage) []plistPage {
+	if len(pages) < 2 {
+		return pages
+	}
+	type group struct {
+		paths []string
+		page  plistPage
+	}
+	groups := make(map[string]*group)
+	var order []string
+	for _, p := range pages {
+		key := p.dedupeKey
+		if key == "" {
+			// Fall back to the body without the leading "# <path>\n\n" title.
+			key = p.body
+			if idx := strings.Index(p.body, "\n"); idx >= 0 {
+				key = p.body[idx+1:]
+			}
+		}
+		g := groups[key]
+		if g == nil {
+			g = &group{page: p}
+			groups[key] = g
+			order = append(order, key)
+		}
+		g.paths = append(g.paths, p.displayPath)
+	}
+
+	var out []plistPage
+	for _, key := range order {
+		g := groups[key]
+		p := g.page
+		if len(g.paths) > 1 {
+			p.body = insertSameDiffNote(p.body, g.paths[1:])
+		}
+		out = append(out, p)
+	}
+	sort.Slice(out, func(i, j int) bool {
+		return out[i].displayPath < out[j].displayPath
+	})
+	return out
+}
+
+// localizedRepresentativeDiff returns the diff of the localized group's
+// representative locale, matching what renderLocalizedPlistPage renders.
+func localizedRepresentativeDiff(group *localizedPlistGroup) string {
+	paths := mapKeys(group.diffByRel)
+	sort.Slice(paths, func(i, j int) bool {
+		li, lj := group.localeByRel[paths[i]], group.localeByRel[paths[j]]
+		if localeSortRank(li) != localeSortRank(lj) {
+			return localeSortRank(li) < localeSortRank(lj)
+		}
+		if li != lj {
+			return li < lj
+		}
+		return paths[i] < paths[j]
+	})
+	return group.diffByRel[paths[0]]
+}
+
+// insertSameDiffNote inserts the "Same diff in" note between the page's
+// title line and the diff content.
+func insertSameDiffNote(body string, paths []string) string {
+	quoted := make([]string, len(paths))
+	for i, p := range paths {
+		quoted[i] = "`" + p + "`"
+	}
+	note := "> Same diff in: " + strings.Join(quoted, ", ") + "\n"
+	idx := strings.Index(body, "\n\n")
+	if idx < 0 {
+		return body + "\n" + note
+	}
+	return body[:idx] + "\n" + note + body[idx+1:]
 }
 
 func plistUpdatedCount(pd *PlistDiff) int {

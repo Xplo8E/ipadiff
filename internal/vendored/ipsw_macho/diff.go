@@ -108,9 +108,54 @@ var appleInternalBuildRootRE = regexp.MustCompile(`/AppleInternal/Library/BuildR
 
 const appleInternalBuildRootPlaceholder = "/AppleInternal/Library/BuildRoots/<BUILDROOT>"
 
-// normalizeBuildPathForDiff collapses every occurrence of the two per-build
-// rotating build-root paths Apple embeds in Mach-O strings and object-file
-// (debug-map) symbols so a rebuild of identical source does not show as a diff.
+// ciBuildDateRE matches date-like build tokens embedded in third-party CI
+// build roots — the non-Apple equivalent of the rotating XBS tokens above:
+// `May_13_2026`, `May-13-2026`, `2026-05-13`, `2026_05_13`. Every vendor's
+// CI stamps a different layout, but they all rotate per build, so the whole
+// token collapses to one placeholder.
+var ciBuildDateRE = regexp.MustCompile(`(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)[-_]?\d{1,2}[-_]?\d{4}|\d{4}[-_]\d{1,2}[-_]\d{1,2}`)
+
+const ciBuildDatePlaceholder = "<BUILDDATE>"
+
+// ciBuildNumberRE matches bare decimal components of six or more digits —
+// CI job / build numbers (`.../ARATTAI_IOS_APP/13399603/...`). Four-digit
+// years and short versions are below the threshold and stay untouched.
+var ciBuildNumberRE = regexp.MustCompile(`\d{6,}`)
+
+const ciBuildNumberPlaceholder = "<BUILDNUM>"
+
+// collapseBuildNumbers rewrites whole path components that are bare decimal
+// numbers of six or more digits. Boundary checks are manual because RE2 has
+// no lookaround and adjacent numeric components would otherwise eat each
+// other's separators.
+func collapseBuildNumbers(value string) string {
+	matches := ciBuildNumberRE.FindAllStringIndex(value, -1)
+	if len(matches) == 0 {
+		return value
+	}
+	var b strings.Builder
+	b.Grow(len(value))
+	last := 0
+	for _, m := range matches {
+		start, end := m[0], m[1]
+		if start > 0 && value[start-1] == '/' && (end == len(value) || value[end] == '/') {
+			b.WriteString(value[last:start])
+			b.WriteString(ciBuildNumberPlaceholder)
+			last = end
+		}
+	}
+	b.WriteString(value[last:])
+	return b.String()
+}
+
+// normalizeBuildPathForDiff collapses every occurrence of the per-build
+// rotating build-root paths Apple and third-party CI systems embed in Mach-O
+// strings and object-file (debug-map) symbols so a rebuild of identical
+// source does not show as a diff: Apple's XBS/AppleInternal roots, generic
+// date tokens, and bare numeric build-number components.
+// ipadiff extension over upstream: the CI date/number passes — ipsw only
+// diffs Apple binaries, ipadiff diffs vendor apps whose CI roots rotate in
+// vendor-specific layouts.
 func normalizeBuildPathForDiff(value string) string {
 	// Every pattern below is rooted at a '/', so a value without one cannot
 	// match any of them. The gate matters because this runs over every symbol
@@ -122,7 +167,9 @@ func normalizeBuildPathForDiff(value string) string {
 	}
 	value = xbsBuildUUIDRE.ReplaceAllString(value, xbsBuildUUIDReplacement)
 	value = xbsTemporaryDirectoryRE.ReplaceAllString(value, xbsTemporaryDirectoryReplacement)
-	return appleInternalBuildRootRE.ReplaceAllString(value, appleInternalBuildRootPlaceholder)
+	value = appleInternalBuildRootRE.ReplaceAllString(value, appleInternalBuildRootPlaceholder)
+	value = ciBuildDateRE.ReplaceAllString(value, ciBuildDatePlaceholder)
+	return collapseBuildNumbers(value)
 }
 
 func normalizeCStringForDiff(value string) string {
@@ -426,7 +473,7 @@ func FormatUpdatedDiff(oldInfo, newInfo *DiffInfo, conf *DiffConfig) (string, er
 	if len(sectionChanges) > 0 {
 		md.WriteString("### Sections with Same Size but Changed Content\n\n")
 		for _, name := range sectionChanges {
-			md.WriteString(fmt.Sprintf("- `%s`\n", name))
+			md.WriteString(fmt.Sprintf("- `%s` — %s\n", name, sectionChangeKind(name)))
 		}
 	}
 	if b.Len() == 0 {
@@ -1136,6 +1183,39 @@ func containsAddedOrRemovedRows(body string) bool {
 	return false
 }
 
+// sectionChangeKind annotates a same-size content-changed section with what
+// kind of change it is, so a reader can tell which rows are explained by the
+// string/symbol diffs below and which are opaque relocated tables.
+// ipadiff addition over upstream.
+func sectionChangeKind(name string) string {
+	switch {
+	case strings.HasSuffix(name, ".__cstring"),
+		strings.HasSuffix(name, ".__os_log"),
+		strings.HasSuffix(name, ".__cfstring"),
+		strings.HasSuffix(name, ".__ustring"):
+		return "string pool — changed literals appear in the CStrings section below"
+	case strings.HasSuffix(name, ".__objc_methname"),
+		strings.HasSuffix(name, ".__objc_classname"),
+		strings.HasSuffix(name, ".__objc_methtype"),
+		strings.HasSuffix(name, ".__swift5_reflstr"):
+		return "ObjC/Swift name pool (not string-diffed)"
+	case strings.HasPrefix(name, "__TEXT.__swift5_"):
+		return "Swift metadata table (relocated offsets)"
+	case strings.Contains(name, ".__objc_"):
+		return "ObjC metadata/pointer table"
+	case strings.HasSuffix(name, ".__init_offsets"),
+		strings.HasSuffix(name, ".__got"),
+		strings.HasSuffix(name, ".__la_symbol_ptr"),
+		strings.HasSuffix(name, ".__nl_symbol_ptr"),
+		strings.HasSuffix(name, ".__mod_init_func"),
+		strings.HasSuffix(name, ".__eh_frame"),
+		strings.HasSuffix(name, ".__unwind_info"):
+		return "pointer/offset table (relocated on rebuild)"
+	default:
+		return "content changed (opaque section)"
+	}
+}
+
 // Equivalent reports whether two DiffInfos have the same report-visible
 // semantics for conf. It deliberately ignores absolute function addresses,
 // which shift when unrelated layout changes move a function without changing
@@ -1247,6 +1327,50 @@ func (i *DiffInfo) stringForDiff(conf *DiffConfig) string {
 	out.WriteString(fmt.Sprintf("  Symbols:   %d\n", len(normalizedStringSet(i.Symbols, normalizeSymbolForDiff))))
 	out.WriteString(fmt.Sprintf("  CStrings:  %d\n", len(normalizedStringSet(i.CStrings, cstringNormalizer(ignoreBuildTimestamps)))))
 	return out.String()
+}
+
+// NormalizedCounts returns the symbol and cstring set sizes under the
+// engine's normalization (build-path tokens and generated counters collapsed)
+// — the counts the diff actually compares, unlike the raw Symtab/CStrings
+// lengths. Build-timestamp collapsing is not applied.
+func NormalizedCounts(i *DiffInfo) (symbols, cstrings int) {
+	if i == nil {
+		return 0, 0
+	}
+	return len(normalizedStringSet(i.Symbols, normalizeSymbolForDiff)),
+		len(normalizedStringSet(i.CStrings, cstringNormalizer(false)))
+}
+
+// DiffCounts returns the added/removed set sizes between two infos under the
+// engine's normalization, plus the function-count delta. Safe with nil inputs.
+func DiffCounts(oldI, newI *DiffInfo) (symAdd, symDel, csAdd, csDel, funcDelta int) {
+	a, b := diffNormalizedSymbols(infoSymbols(oldI), infoSymbols(newI))
+	symAdd, symDel = len(a), len(b)
+	c, d := diffNormalizedCStrings(infoCStrings(oldI), infoCStrings(newI), false)
+	csAdd, csDel = len(c), len(d)
+	funcDelta = infoFunctions(newI) - infoFunctions(oldI)
+	return
+}
+
+func infoFunctions(i *DiffInfo) int {
+	if i == nil {
+		return 0
+	}
+	return i.Functions
+}
+
+func infoSymbols(i *DiffInfo) []string {
+	if i == nil {
+		return nil
+	}
+	return i.Symbols
+}
+
+func infoCStrings(i *DiffInfo) []string {
+	if i == nil {
+		return nil
+	}
+	return i.CStrings
 }
 
 // Generate computes New/Removed/Updated across two parallel

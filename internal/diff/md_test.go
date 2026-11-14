@@ -146,23 +146,35 @@ func TestWriteMarkdown_IgnoresConfiguredOutput(t *testing.T) {
 	}
 }
 
-func TestCollectPlists_AddsParseWarning(t *testing.T) {
+func TestCollectPlists_TextFallbackAndBinaryWarning(t *testing.T) {
 	dir := t.TempDir()
-	if err := os.WriteFile(filepath.Join(dir, "Broken.plist"), []byte("not a plist"), 0o644); err != nil {
+	// Text-like invalid plist: falls back to raw bytes, no warning, no drop.
+	if err := os.WriteFile(filepath.Join(dir, "OpenStep.strings"), []byte(`definitely "not" a @@@ parseable plist`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	// Binary look-alike (NUL early): dropped with a parse warning.
+	if err := os.WriteFile(filepath.Join(dir, "Broken.plist"), []byte("not\x00a\x00plist"), 0o644); err != nil {
 		t.Fatal(err)
 	}
 	d := &Diff{cfg: &Config{Workers: 4}}
-	got, _ := d.collectPlists("old", &bundle.Bundle{
+	got, _, raw := d.collectPlists("old", &bundle.Bundle{
 		AppDir: dir,
 		Files: map[string]bundle.FileMeta{
-			"Broken.plist": {Kind: bundle.KindPlist},
+			"OpenStep.strings": {Kind: bundle.KindPlist},
+			"Broken.plist":     {Kind: bundle.KindPlist},
 		},
 	})
-	if len(got) != 0 {
-		t.Fatalf("collectPlists returned parsed data for invalid plist: %#v", got)
+	if got["OpenStep.strings"] != `definitely "not" a @@@ parseable plist` {
+		t.Fatalf("text-like invalid plist must fall back to raw bytes, got %#v", got["OpenStep.strings"])
+	}
+	if len(raw) != 1 || raw[0] != "OpenStep.strings" {
+		t.Fatalf("raw fallback list = %#v, want [OpenStep.strings]", raw)
+	}
+	if _, ok := got["Broken.plist"]; ok {
+		t.Fatalf("binary look-alike must be dropped, got %#v", got["Broken.plist"])
 	}
 	if len(d.Warnings) != 1 {
-		t.Fatalf("warnings = %#v, want one parse warning", d.Warnings)
+		t.Fatalf("warnings = %#v, want one parse warning for the binary file", d.Warnings)
 	}
 	if d.Warnings[0].Section != "plists" || d.Warnings[0].Path != "Broken.plist" {
 		t.Fatalf("unexpected warning: %#v", d.Warnings[0])

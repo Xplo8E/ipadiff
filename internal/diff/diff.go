@@ -78,10 +78,14 @@ func (c *Config) Defaults() {
 }
 
 // PlistDiff records new / removed / updated plists (by bundle-relative path).
+// Raw lists the common paths compared as raw text because plist
+// canonicalization failed on at least one side (OpenStep-format .strings and
+// friends); their diffs are real byte diffs, so identical files stay silent.
 type PlistDiff struct {
 	New     []string          `json:"new,omitempty"`
 	Removed []string          `json:"removed,omitempty"`
 	Updated map[string]string `json:"updated,omitempty"`
+	Raw     []string          `json:"raw,omitempty"`
 }
 
 // ResourcesDiff splits non-plist, non-macho file diffs by treatment.

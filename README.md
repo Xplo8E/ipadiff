@@ -92,6 +92,8 @@ The inner report directory is still derived from bundle metadata:
 | `--no-objc` | false | Skip Obj-C metadata diffs |
 | `--no-swift` | false | Skip Swift metadata diffs |
 | `--skip-resources` | false | Skip text-resource diffs |
+| `--ignore-build-timestamps` | false | Collapse `__DATE__`/`__TIME__`/`__TIMESTAMP__` cstrings to a placeholder |
+| `--facts` | false | Write `facts.json` with per-binary machine-readable comparison facts (multi-file output only) |
 | `--allow-list` | none | Mach-O sections to include, for example `__TEXT.__text` |
 | `--block-list` | none | Mach-O sections to exclude |
 | `--workers` | `GOMAXPROCS` | Parallel workers for per-binary and per-file phases |

@@ -37,6 +37,11 @@ type Config struct {
 	// the knob exists for library callers diffing container-relocated images.
 	IgnoreLoadCommands bool
 
+	// Facts emits machine-readable per-binary comparison facts (sections,
+	// load commands, entitlements, launch constraints) as facts.json in the
+	// multi-file report directory. Streamed Markdown output ignores this.
+	Facts bool
+
 	AllowList []string // glob filter on Mach-O section names (Seg.Section)
 	BlockList []string
 
@@ -143,6 +148,11 @@ type Diff struct {
 	mainNew  *vmacho.DiffInfo
 	oldInfos map[string]*vmacho.DiffInfo
 	newInfos map[string]*vmacho.DiffInfo
+
+	// Per-binary comparison facts for both sides, keyed by bundle-relative
+	// path. Populated only when cfg.Facts is set.
+	factsOld map[string]*vmacho.ComparisonFacts
+	factsNew map[string]*vmacho.ComparisonFacts
 
 	cfg *Config
 }

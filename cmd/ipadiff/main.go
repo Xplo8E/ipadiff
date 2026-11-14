@@ -29,6 +29,7 @@ func main() {
 		skipResources bool
 		keepBuildKeys bool
 		noTimestamps  bool
+		facts         bool
 		allowList     []string
 		blockList     []string
 		workers       int
@@ -69,6 +70,7 @@ func main() {
 				SkipResources:         skipResources,
 				KeepBuildKeys:         keepBuildKeys,
 				IgnoreBuildTimestamps: noTimestamps,
+				Facts:                 facts,
 				AllowList:             allowList,
 				BlockList:             blockList,
 				Workers:               workers,
@@ -120,6 +122,7 @@ func main() {
 	f.BoolVar(&skipResources, "skip-resources", false, "Skip text-resource diffs")
 	f.BoolVar(&keepBuildKeys, "keep-build-keys", false, "Keep Xcode/toolchain build-metadata keys (DTXcode, DTSDKBuild, ...) in plist diffs (default: suppressed)")
 	f.BoolVar(&noTimestamps, "ignore-build-timestamps", false, "Collapse __DATE__/__TIME__/__TIMESTAMP__ cstrings to a placeholder (default: report them)")
+	f.BoolVar(&facts, "facts", false, "Write facts.json with per-binary machine-readable comparison facts (multi-file output only)")
 	f.StringSliceVar(&allowList, "allow-list", nil, "Mach-O sections to include (e.g. __TEXT.__text)")
 	f.StringSliceVar(&blockList, "block-list", nil, "Mach-O sections to exclude")
 	f.IntVar(&workers, "workers", 0, "Parallel workers for per-binary and per-file diff phases (default: GOMAXPROCS)")

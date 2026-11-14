@@ -1,6 +1,7 @@
 package diff
 
 import (
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -373,11 +374,42 @@ func (d *Diff) writeMultiFile(output string) error {
 		links.hasHermes = true
 	}
 
+	if d.cfg.Facts {
+		if err := d.writeFacts(root); err != nil {
+			return fmt.Errorf("write facts: %w", err)
+		}
+	}
+
 	return os.WriteFile(
 		filepath.Join(root, "README.md"),
 		[]byte(renderReadme(d, &links)),
 		0o644,
 	)
+}
+
+// writeFacts emits machine-readable per-binary comparison facts for both
+// sides, keyed by bundle-relative path. Each binary's facts carry the policy
+// that produced them, section content hashes, the load-command digest, and
+// the code signature's entitlements + launch constraints, so scripted
+// consumers can diff the JSON without re-parsing Mach-Os.
+func (d *Diff) writeFacts(root string) error {
+	if len(d.factsOld) == 0 && len(d.factsNew) == 0 {
+		return nil
+	}
+	type factsFile struct {
+		Schema string                             `json:"schema"`
+		Old    map[string]*vmacho.ComparisonFacts `json:"old,omitempty"`
+		New    map[string]*vmacho.ComparisonFacts `json:"new,omitempty"`
+	}
+	data, err := json.MarshalIndent(factsFile{
+		Schema: "ipadiff-facts-v1",
+		Old:    d.factsOld,
+		New:    d.factsNew,
+	}, "", "  ")
+	if err != nil {
+		return err
+	}
+	return os.WriteFile(filepath.Join(root, "facts.json"), append(data, '\n'), 0o644)
 }
 
 func (d *Diff) safeOutputRoot(output string) (string, error) {

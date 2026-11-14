@@ -32,6 +32,10 @@ func (d *Diff) diffMachos() error {
 		Verbose:               d.cfg.Verbose,
 	}
 
+	if d.cfg.Facts {
+		d.factsOld = make(map[string]*vmacho.ComparisonFacts)
+		d.factsNew = make(map[string]*vmacho.ComparisonFacts)
+	}
 	prev := d.collectMachos("old", d.Old, conf)
 	next := d.collectMachos("new", d.New, conf)
 	d.oldInfos = prev
@@ -49,23 +53,25 @@ func (d *Diff) diffMachos() error {
 // collectMachos walks the main executable plus every non-main Mach-O in the
 // bundle and produces a DiffInfo map keyed by bundle-relative path.
 // Encrypted binaries get a degraded info (sections + imports only) so we can
-// still report structural changes.
+// still report structural changes. When cfg.Facts is set, per-binary
+// comparison facts are collected alongside into d.factsOld / d.factsNew.
 type machoInfoResult struct {
 	rel     string
 	info    *vmacho.DiffInfo
+	facts   *vmacho.ComparisonFacts
 	warning string
 }
 
 func (d *Diff) collectMachos(side string, b *bundle.Bundle, conf *vmacho.DiffConfig) map[string]*vmacho.DiffInfo {
 	out := make(map[string]*vmacho.DiffInfo)
+	wantFacts := d.cfg.Facts
 
 	targets := append([]string{b.ExeName}, b.Frameworks...)
 	sort.Strings(targets)
 	log.WithField("count", len(targets)).Debug("collecting macho DiffInfo")
 	results := runStringWorkers(targets, d.cfg.Workers, func(rel string) machoInfoResult {
 		log.WithField("binary", rel).Debug("generating diff info")
-		info, warning := buildInfo(b, rel, conf)
-		return machoInfoResult{rel: rel, info: info, warning: warning}
+		return buildInfo(b, rel, conf, wantFacts)
 	})
 	for _, result := range results {
 		if result.warning != "" {
@@ -74,24 +80,43 @@ func (d *Diff) collectMachos(side string, b *bundle.Bundle, conf *vmacho.DiffCon
 		if result.info != nil {
 			out[result.rel] = result.info
 		}
+		if result.facts != nil {
+			if side == "old" {
+				d.factsOld[result.rel] = result.facts
+			} else {
+				d.factsNew[result.rel] = result.facts
+			}
+		}
 	}
 	return out
 }
 
-func buildInfo(b *bundle.Bundle, rel string, conf *vmacho.DiffConfig) (*vmacho.DiffInfo, string) {
+func buildInfo(b *bundle.Bundle, rel string, conf *vmacho.DiffConfig, wantFacts bool) machoInfoResult {
 	full := filepath.Join(b.AppDir, rel)
 	m, err := openMacho(full)
 	if err != nil {
 		log.WithError(err).Debugf("skip macho %s: %v", rel, err)
-		return nil, fmt.Sprintf("skipped Mach-O: %v", err)
+		return machoInfoResult{rel: rel, warning: fmt.Sprintf("skipped Mach-O: %v", err)}
 	}
 	defer m.Close()
 
-	encrypted := b.Files[rel].Encrypted
-	if encrypted {
-		return vmacho.GenerateDiffInfoDegraded(m, conf), "FairPlay-encrypted; using structural diff only"
+	var info *vmacho.DiffInfo
+	warning := ""
+	if b.Files[rel].Encrypted {
+		info = vmacho.GenerateDiffInfoDegraded(m, conf)
+		warning = "FairPlay-encrypted; using structural diff only"
+	} else {
+		info = vmacho.GenerateDiffInfo(m, conf)
 	}
-	return vmacho.GenerateDiffInfo(m, conf), ""
+	res := machoInfoResult{rel: rel, info: info, warning: warning}
+	if wantFacts {
+		// Facts reflect the same policy that produced info; the code
+		// signature (entitlements + launch constraints) is read while the
+		// Mach-O is still open.
+		facts := vmacho.GenerateComparisonFacts(m, info, conf)
+		res.facts = &facts
+	}
+	return res
 }
 
 // openMacho handles thin and fat binaries. For fat, picks the slice whose

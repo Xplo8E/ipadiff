@@ -105,9 +105,11 @@ The inner report directory is still derived from bundle metadata:
 ```text
 <outer>/<bundleID>_<oldVersion>_<newVersion>/
 ├── README.md
+├── Entitlements.md
 ├── <BundleName>.md
 ├── facts.json
-├── MACHOS/
+├── FRAMEWORKS/
+├── PLUGINS/
 ├── HERMES/
 │   └── main_jsbundle/
 │       ├── README.md
@@ -118,7 +120,7 @@ The inner report directory is still derived from bundle metadata:
 └── RESOURCES/
 ```
 
-Only sections with content are written. Large sections spill into their own directories and are linked from the top-level report. `facts.json` is written only with `--facts` and carries machine-readable per-binary comparison facts (policy, section content hashes, load-command digest, entitlements, launch constraints) for both sides, keyed by bundle-relative path.
+Only directories with content are written. The README is a pure index — title, `## Inputs`, Bundle Summary, the Change Surface table, then counted `#### 🆕 NEW (n) / ❌ Removed (n) / ⬆️ Updated (n)` triples per group (Main Binary, Frameworks, Plugins, Plists, Entitlements, Resources, Hermes, File Tree, Warnings) under one uniform list rule: fewer than 30 entries render as plain bullets, up to 1000 collapse into `<details>`, anything larger spills to a side-car doc behind a single "View N" link. Entitlements live in the `Entitlements.md` side-car; binary copies that compared identically collapse into stub pages pointing at the representative. `facts.json` is written only with `--facts` and carries machine-readable per-binary comparison facts (policy, section content hashes, load-command digest, entitlements, launch constraints) for both sides, keyed by bundle-relative path.
 
 ## Hermes Support
 

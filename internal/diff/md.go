@@ -38,7 +38,11 @@ func (d *Diff) Markdown(w io.Writer) error {
 // WriteMarkdown streams a single-file Markdown report to w, regardless of
 // Config.Output. Use WriteFiles for the multi-file layout.
 func (d *Diff) WriteMarkdown(w io.Writer) error {
-	_, err := io.WriteString(w, renderReadme(d, nil))
+	out, err := renderReadme(d, nil, "")
+	if err != nil {
+		return err
+	}
+	_, err = io.WriteString(w, out)
 	return err
 }
 
@@ -287,7 +291,11 @@ func (d *Diff) writeMultiFile(output string) error {
 	}
 
 	used := map[string]bool{}
-	links := readmeLinks{binaryFiles: map[string]string{}}
+	links := readmeLinks{
+		binaryFiles:   map[string]string{},
+		plistFiles:    map[string]string{},
+		resourceFiles: map[string]string{},
+	}
 
 	// Track whether at least one binary in each non-main bucket exists,
 	// so renderStats can decide whether to surface the dir-link.
@@ -336,7 +344,7 @@ func (d *Diff) writeMultiFile(output string) error {
 	links.hasFrameworks = hasFrameworkDir
 	links.hasPlugins = hasPluginDir
 
-	// Per-plist files — README links to the folder only, no per-file index.
+	// Per-plist diff pages; the README links each page individually.
 	if d.Plists != nil && len(d.Plists.Updated) > 0 {
 		pages := buildPlistPages(d.Plists)
 		if len(pages) > 0 {
@@ -348,12 +356,15 @@ func (d *Diff) writeMultiFile(output string) error {
 				if err := os.WriteFile(filepath.Join(root, rel2), []byte(page.body), 0o644); err != nil {
 					return err
 				}
+				links.plistFiles[page.displayPath] = rel2
 			}
 			links.hasPlists = true
 		}
 	}
 
-	if shouldSpillResources(d.Resources) {
+	// Resource diff pages: every updated text resource gets its own page so
+	// the README stays a pure index.
+	if d.Resources != nil && len(d.Resources.Updated) > 0 {
 		if err := os.MkdirAll(filepath.Join(root, "RESOURCES"), 0o755); err != nil {
 			return err
 		}
@@ -363,8 +374,19 @@ func (d *Diff) writeMultiFile(output string) error {
 			if err := os.WriteFile(filepath.Join(root, rel2), []byte(page.body), 0o644); err != nil {
 				return err
 			}
+			if page.displayPath != "" {
+				links.resourceFiles[page.displayPath] = rel2
+			}
 		}
 		links.hasResources = true
+	}
+
+	// Entitlements side-car: the README links it instead of inlining the diff.
+	if entCount := countEntChanges(d.Ents); entCount > 0 {
+		body := fmt.Sprintf("# Entitlements\n\n%d changed binaries.\n\n%s\n", entCount, d.Ents)
+		if err := os.WriteFile(filepath.Join(root, "Entitlements.md"), []byte(body), 0o644); err != nil {
+			return err
+		}
 	}
 
 	if ok, err := d.writeHermesFiles(root); err != nil {
@@ -379,9 +401,13 @@ func (d *Diff) writeMultiFile(output string) error {
 		}
 	}
 
+	out, err := renderReadme(d, &links, root)
+	if err != nil {
+		return err
+	}
 	return os.WriteFile(
 		filepath.Join(root, "README.md"),
-		[]byte(renderReadme(d, &links)),
+		[]byte(out),
 		0o644,
 	)
 }
@@ -468,21 +494,430 @@ type readmeLinks struct {
 	hasResources  bool
 	hasHermes     bool
 	binaryFiles   map[string]string
+	// plistFiles / resourceFiles map a page's display path to the written
+	// file name, so the README can link every diff page individually.
+	plistFiles    map[string]string
+	resourceFiles map[string]string
 }
 
-func renderReadme(d *Diff, links *readmeLinks) string {
+// ----- uniform list rule ----------------------------------------------------
+//
+// Every counted list in the README renders under one three-state rule,
+// mirroring the latest ipsw diff renderer: fewer than listCollapseThreshold
+// entries render as plain bullets, up to listSpillThreshold entries collapse
+// into a <details> block, and anything at or above listSpillThreshold spills
+// to a side-car doc with a single "View N" link (file mode only — the
+// streamed report collapses instead of writing files).
+
+const (
+	listCollapseThreshold = 30
+	listSpillThreshold    = 1000
+)
+
+// listLine is one README bullet: plain text (href "") or a markdown link.
+// href is always relative to the report root (page file names already carry
+// their section directory), so it is used verbatim.
+type listLine struct {
+	text string
+	href string
+}
+
+func (l listLine) markdown() string {
+	if l.href == "" {
+		return "- `" + l.text + "`\n"
+	}
+	return fmt.Sprintf("- [%s](%s)\n", l.text, l.href)
+}
+
+// renderCountedList renders one counted heading plus its bullets under the
+// three-state rule. spillSubDir/spillLabel control the side-car doc for the
+// spill case; an empty root (streamed report) skips spilling and collapses.
+func renderCountedList(out *strings.Builder, headingPrefix, title string, lines []listLine, root, spillSubDir, spillLabel string) error {
+	if len(lines) == 0 {
+		return nil
+	}
+	fmt.Fprintf(out, "%s %s (%d)\n\n", headingPrefix, title, len(lines))
+	switch {
+	case len(lines) >= listSpillThreshold && root != "" && spillSubDir != "":
+		var body strings.Builder
+		fmt.Fprintf(&body, "## %s (%d)\n\n", title, len(lines))
+		for _, l := range lines {
+			body.WriteString(l.markdown())
+		}
+		relName, err := writeSpillDoc(root, spillSubDir, spillLabel, body.String())
+		if err != nil {
+			return err
+		}
+		fmt.Fprintf(out, "- [View %d entries](%s)\n\n", len(lines), filepath.Join(spillSubDir, relName))
+	case len(lines) >= listCollapseThreshold:
+		fmt.Fprintf(out, "<details>\n  <summary><i>View %s</i></summary>\n\n", strings.TrimSpace(title))
+		for _, l := range lines {
+			out.WriteString(l.markdown())
+		}
+		out.WriteString("\n</details>\n\n")
+	default:
+		for _, l := range lines {
+			out.WriteString(l.markdown())
+		}
+		out.WriteString("\n")
+	}
+	return nil
+}
+
+// renderDiffTriple renders the 🆕 NEW / ❌ Removed / ⬆️ Updated triple for one
+// binary group or section.
+func renderDiffTriple(out *strings.Builder, headingPrefix string, newLines, removedLines, updatedLines []listLine, root, spillSubDir, label string) error {
+	if err := renderCountedList(out, headingPrefix, "🆕 NEW", newLines, root, spillSubDir, label+".New"); err != nil {
+		return err
+	}
+	if err := renderCountedList(out, headingPrefix, "❌ Removed", removedLines, root, spillSubDir, label+".Removed"); err != nil {
+		return err
+	}
+	return renderCountedList(out, headingPrefix, "⬆️ Updated", updatedLines, root, spillSubDir, label+".Updated")
+}
+
+// writeSpillDoc writes body to <root>/<subDir>/<label>.md (sanitized) and
+// returns the base name for the README link.
+func writeSpillDoc(root, subDir, label, body string) (string, error) {
+	relName := safeName(label) + ".md"
+	fname := filepath.Join(root, subDir, relName)
+	if err := os.MkdirAll(filepath.Dir(fname), 0o755); err != nil {
+		return "", err
+	}
+	if err := os.WriteFile(fname, []byte(body), 0o644); err != nil {
+		return "", err
+	}
+	return relName, nil
+}
+
+// nameLines converts sorted rel paths to plain bullets.
+func nameLines(paths []string) []listLine {
+	lines := make([]listLine, 0, len(paths))
+	for _, p := range paths {
+		lines = append(lines, listLine{text: p})
+	}
+	return lines
+}
+
+// linkLines converts path->file-name maps to sorted link bullets.
+func linkLines(m map[string]string) []listLine {
+	keys := mapKeys(m)
+	sort.Strings(keys)
+	lines := make([]listLine, 0, len(keys))
+	for _, k := range keys {
+		lines = append(lines, listLine{text: k, href: m[k]})
+	}
+	return lines
+}
+
+// renderReadme composes the index README. In file mode (links non-nil, root
+// set) it is a pure index: every diff lives in its own page or side-car doc
+// and the README shows counted, emoji-tagged links under the uniform
+// three-state list rule. The streamed report (links nil, root empty) inlines
+// the diffs it cannot link to.
+func renderReadme(d *Diff, links *readmeLinks, root string) (string, error) {
 	var b strings.Builder
 	fmt.Fprintf(&b, "# %s\n\n", d.Title)
-	renderSummary(&b, d)
-	renderStats(&b, d, links)
-	renderWarnings(&b, d)
-	renderFileTree(&b, d)
-	renderEntitlements(&b, d)
-	renderProvisioning(&b, d)
-	if links == nil || !links.hasResources {
-		renderResourcesInline(&b, d)
+	if note := d.statusNote(); note != "" {
+		b.WriteString(note + "\n")
 	}
-	return b.String()
+
+	// Inputs
+	fmt.Fprintf(&b, "## Inputs\n\n- `%s`\n- `%s`\n\n",
+		filepath.Base(d.Old.IPAPath), filepath.Base(d.New.IPAPath))
+
+	renderSummary(&b, d)
+	renderChangeSurfaceSection(&b, d, links)
+	renderMainBinarySection(&b, d, links)
+	if err := renderMachoGroupSections(&b, d, links, root); err != nil {
+		return "", err
+	}
+	if err := renderPlistsSection(&b, d, links, root); err != nil {
+		return "", err
+	}
+	renderEntitlementsSection(&b, d, links)
+	renderProvisioning(&b, d)
+	if err := renderResourcesSection(&b, d, links, root); err != nil {
+		return "", err
+	}
+	if err := renderHermesSection(&b, d, links, root); err != nil {
+		return "", err
+	}
+	if err := renderFileTreeSection(&b, d, root); err != nil {
+		return "", err
+	}
+	if err := renderWarningsSection(&b, d, root); err != nil {
+		return "", err
+	}
+	b.WriteString("## EOF\n")
+	return b.String(), nil
+}
+
+// statusNote carries the no-change case so an empty diff never renders as a
+// bare title.
+func (d *Diff) statusNote() string {
+	if d.diffEmpty() {
+		return "> No differences found.\n"
+	}
+	return ""
+}
+
+func (d *Diff) diffEmpty() bool {
+	machosEmpty := d.Machos == nil ||
+		(len(d.Machos.New) == 0 && len(d.Machos.Removed) == 0 && len(d.Machos.Updated) == 0)
+	plistsEmpty := d.Plists == nil ||
+		(len(d.Plists.New) == 0 && len(d.Plists.Removed) == 0 && len(d.Plists.Updated) == 0 && len(d.Plists.Raw) == 0)
+	resEmpty := d.Resources == nil ||
+		(len(d.Resources.New) == 0 && len(d.Resources.Removed) == 0 && len(d.Resources.Updated) == 0 && len(d.Resources.SizeOnly) == 0)
+	hermesEmpty := d.Hermes == nil ||
+		(len(d.Hermes.New) == 0 && len(d.Hermes.Removed) == 0 && len(d.Hermes.Updated) == 0)
+	ftEmpty := d.FileTree == nil || (len(d.FileTree.New) == 0 && len(d.FileTree.Removed) == 0)
+	metaEmpty := len(d.ObjC) == 0 && len(d.Swift) == 0 &&
+		strings.TrimSpace(d.Ents) == "" && strings.TrimSpace(d.Provisioning) == ""
+	return machosEmpty && plistsEmpty && resEmpty && hermesEmpty && ftEmpty && metaEmpty
+}
+
+// renderChangeSurfaceSection promotes the per-binary delta table to its own
+// section: it replaces the old Stats bullets as the at-a-glance view.
+func renderChangeSurfaceSection(b *strings.Builder, d *Diff, links *readmeLinks) {
+	if table := renderChangeSurface(d, links); table != "" {
+		b.WriteString("## Change Surface\n\n")
+		b.WriteString(table)
+	}
+}
+
+func renderMainBinarySection(b *strings.Builder, d *Diff, links *readmeLinks) {
+	mainExe := d.New.ExeName
+	if mainExe == "" {
+		mainExe = d.Old.ExeName
+	}
+	b.WriteString("## Main Binary\n\n")
+	if !mainHasContent(d, mainExe) {
+		b.WriteString("- unchanged\n\n")
+		return
+	}
+	href := ""
+	if links != nil {
+		href = links.main
+	}
+	if href != "" {
+		fmt.Fprintf(b, "#### ⬆️ Updated (1)\n\n- [%s](./%s)\n\n", mainExe, href)
+		return
+	}
+	fmt.Fprintf(b, "#### ⬆️ Updated (1)\n\n- `%s`\n\n", mainExe)
+}
+
+// renderMachoGroupSections renders the Frameworks and Plugins groups as
+// counted NEW/Removed/Updated triples over the non-main Mach-O diffs.
+func renderMachoGroupSections(b *strings.Builder, d *Diff, links *readmeLinks, root string) error {
+	mainExe := d.New.ExeName
+	if mainExe == "" {
+		mainExe = d.Old.ExeName
+	}
+	if d.Machos == nil {
+		return nil
+	}
+	groups := []struct {
+		heading string
+		match   func(rel string) bool
+		subDir  string
+		label   string
+	}{
+		{"## Frameworks", func(rel string) bool {
+			return strings.HasPrefix(rel, "Frameworks"+string(filepath.Separator))
+		}, "FRAMEWORKS", "Frameworks"},
+		{"## Plugins", func(rel string) bool { return true }, "PLUGINS", "Plugins"},
+	}
+	for _, g := range groups {
+		var newL, rmL, upL []listLine
+		for _, rel := range d.Machos.New {
+			if rel != mainExe && g.match(rel) {
+				newL = append(newL, listLine{text: rel})
+			}
+		}
+		for _, rel := range d.Machos.Removed {
+			if rel != mainExe && g.match(rel) {
+				rmL = append(rmL, listLine{text: rel})
+			}
+		}
+		for rel := range d.Machos.Updated {
+			if rel != mainExe && g.match(rel) {
+				href := ""
+				if links != nil {
+					href = links.binaryFiles[rel]
+				}
+				upL = append(upL, listLine{text: rel, href: href})
+			}
+		}
+		sortListLines(newL)
+		sortListLines(rmL)
+		sortListLines(upL)
+		if len(newL)+len(rmL)+len(upL) == 0 {
+			continue
+		}
+		b.WriteString(g.heading + "\n\n")
+		if err := renderDiffTriple(b, "####", newL, rmL, upL, root, g.subDir, g.label); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func renderPlistsSection(b *strings.Builder, d *Diff, links *readmeLinks, root string) error {
+	pd := d.Plists
+	if pd == nil {
+		return nil
+	}
+	if len(pd.New) == 0 && len(pd.Removed) == 0 && len(pd.Updated) == 0 && len(pd.Raw) == 0 {
+		return nil
+	}
+	b.WriteString("## Plists\n\n")
+	var upL []listLine
+	var inlineKeys []string
+	if links != nil && len(links.plistFiles) > 0 {
+		upL = linkLines(links.plistFiles)
+	} else {
+		// Streamed report: no side-car pages exist; count here, inline below.
+		inlineKeys = mapKeys(pd.Updated)
+		sort.Strings(inlineKeys)
+		upL = nameLines(inlineKeys)
+	}
+	if err := renderDiffTriple(b, "####", nameLines(pd.New), nameLines(pd.Removed), upL, root, "PLISTS", "Plists"); err != nil {
+		return err
+	}
+	if links == nil && len(inlineKeys) > 0 {
+		for _, k := range inlineKeys {
+			fmt.Fprintf(b, "<details>\n<summary><code>%s</code></summary>\n\n%s\n\n</details>\n\n", k, pd.Updated[k])
+		}
+	}
+	if len(pd.Raw) > 0 {
+		fmt.Fprintf(b, "\n> %d plists compared as raw bytes (canonicalization failed; identical files are silent).\n\n", len(pd.Raw))
+	}
+	return nil
+}
+
+func renderEntitlementsSection(b *strings.Builder, d *Diff, links *readmeLinks) {
+	if strings.TrimSpace(d.Ents) == "" {
+		return
+	}
+	b.WriteString("## Entitlements\n\n")
+	count := countEntChanges(d.Ents)
+	if count == 0 {
+		b.WriteString("- unchanged\n\n")
+		return
+	}
+	if links != nil {
+		// The diff lives in the Entitlements.md side-car (file mode).
+		fmt.Fprintf(b, "#### ⬆️ Updated (%d)\n\n- [Entitlements DIFF](./Entitlements.md)\n\n", count)
+		return
+	}
+	fmt.Fprintf(b, "#### ⬆️ Updated (%d)\n\n", count)
+	b.WriteString(d.Ents)
+	b.WriteString("\n")
+}
+
+func renderResourcesSection(b *strings.Builder, d *Diff, links *readmeLinks, root string) error {
+	r := d.Resources
+	if r == nil {
+		return nil
+	}
+	if len(r.New) == 0 && len(r.Removed) == 0 && len(r.Updated) == 0 && len(r.SizeOnly) == 0 {
+		return nil
+	}
+	b.WriteString("## Resources\n\n")
+	var upL []listLine
+	var inlineKeys []string
+	if links != nil && len(links.resourceFiles) > 0 {
+		upL = linkLines(links.resourceFiles)
+	} else if links == nil {
+		inlineKeys = mapKeys(r.Updated)
+		sort.Strings(inlineKeys)
+		upL = nameLines(inlineKeys)
+	}
+	if err := renderDiffTriple(b, "####", nameLines(r.New), nameLines(r.Removed), upL, root, "RESOURCES", "Resources"); err != nil {
+		return err
+	}
+	if links == nil && len(inlineKeys) > 0 {
+		for _, k := range inlineKeys {
+			fmt.Fprintf(b, "<details>\n<summary><code>%s</code></summary>\n\n%s\n\n</details>\n\n", k, r.Updated[k])
+		}
+	}
+	if len(r.SizeOnly) > 0 {
+		keys := mapKeys(r.SizeOnly)
+		sort.Strings(keys)
+		lines := make([]listLine, 0, len(keys))
+		for _, k := range keys {
+			lines = append(lines, listLine{text: fmt.Sprintf("%s — %s", k, r.SizeOnly[k])})
+		}
+		if err := renderCountedList(b, "####", "📦 Size changes (binary)", lines, root, "RESOURCES", "Resources.SizeChanges"); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func renderHermesSection(b *strings.Builder, d *Diff, links *readmeLinks, root string) error {
+	h := d.Hermes
+	if h == nil {
+		return nil
+	}
+	if len(h.New) == 0 && len(h.Removed) == 0 && len(h.Updated) == 0 {
+		return nil
+	}
+	b.WriteString("## Hermes\n\n")
+	var upL []listLine
+	if len(h.Updated) > 0 {
+		if links != nil && links.hasHermes {
+			upL = []listLine{{text: "bundle diffs", href: filepath.Join("HERMES", "README.md")}}
+		} else {
+			keys := make([]string, 0, len(h.Updated))
+			for k := range h.Updated {
+				keys = append(keys, k)
+			}
+			upL = nameLines(keys)
+		}
+	}
+	return renderDiffTriple(b, "####", nameLines(h.New), nameLines(h.Removed), upL, root, "HERMES", "Hermes")
+}
+
+func renderProvisioning(b *strings.Builder, d *Diff) {
+	if strings.TrimSpace(d.Provisioning) == "" {
+		return
+	}
+	b.WriteString("## Provisioning Profile\n\n")
+	b.WriteString(d.Provisioning)
+	b.WriteString("\n\n")
+}
+
+func renderFileTreeSection(b *strings.Builder, d *Diff, root string) error {
+	if d.FileTree == nil {
+		return nil
+	}
+	if len(d.FileTree.New) == 0 && len(d.FileTree.Removed) == 0 {
+		return nil
+	}
+	b.WriteString("## File Tree\n\n")
+	return renderDiffTriple(b, "####", nameLines(d.FileTree.New), nameLines(d.FileTree.Removed), nil, root, "FILE_TREE", "FileTree")
+}
+
+func renderWarningsSection(b *strings.Builder, d *Diff, root string) error {
+	if len(d.Warnings) == 0 {
+		return nil
+	}
+	lines := make([]listLine, 0, len(d.Warnings))
+	for _, w := range d.Warnings {
+		label := w.Section
+		if w.Path != "" {
+			label += "/" + w.Path
+		}
+		lines = append(lines, listLine{text: fmt.Sprintf("%s — %s", label, w.Message)})
+	}
+	b.WriteString("## Warnings\n\n")
+	return renderCountedList(b, "####", "Skipped / degraded", lines, root, "", "Warnings")
+}
+
+func sortListLines(lines []listLine) {
+	sort.Slice(lines, func(i, j int) bool { return lines[i].text < lines[j].text })
 }
 
 func renderSummary(b *strings.Builder, d *Diff) {
@@ -499,112 +934,6 @@ func renderSummary(b *strings.Builder, d *Diff) {
 	if d.Old.MainEncrypted || d.New.MainEncrypted {
 		fmt.Fprintf(b, "| **Encrypted main** | %v | %v |\n", d.Old.MainEncrypted, d.New.MainEncrypted)
 	}
-	b.WriteString("\n")
-}
-
-// renderStats produces the section-by-section dashboard. Counts come from
-// the diff struct; links point at per-binary files (main) or per-section
-// dirs (FRAMEWORKS / PLUGINS / PLISTS).
-func renderStats(b *strings.Builder, d *Diff, links *readmeLinks) {
-	b.WriteString("## Stats\n\n")
-
-	mainExe := d.New.ExeName
-	if mainExe == "" {
-		mainExe = d.Old.ExeName
-	}
-
-	// Main binary status.
-	mainChanged := mainHasContent(d, mainExe)
-	switch {
-	case mainChanged && links != nil && links.main != "":
-		fmt.Fprintf(b, "- **Main binary** — updated → [%s](./%s)\n", mainExe, links.main)
-	case mainChanged:
-		fmt.Fprintf(b, "- **Main binary** (`%s`) — updated\n", mainExe)
-	default:
-		fmt.Fprintf(b, "- **Main binary** (`%s`) — unchanged\n", mainExe)
-	}
-
-	// Mach-Os: roll up across non-main binaries.
-	if d.Machos != nil {
-		nonMainUpdated := 0
-		for k := range d.Machos.Updated {
-			if k != mainExe {
-				nonMainUpdated++
-			}
-		}
-		var dirs []string
-		if links != nil && links.hasFrameworks {
-			dirs = append(dirs, "[FRAMEWORKS/](./FRAMEWORKS/)")
-		}
-		if links != nil && links.hasPlugins {
-			dirs = append(dirs, "[PLUGINS/](./PLUGINS/)")
-		}
-		suffix := ""
-		if len(dirs) > 0 {
-			suffix = " → " + strings.Join(dirs, ", ")
-		}
-		fmt.Fprintf(b, "- **Mach-Os** — %d new, %d removed, %d updated%s\n",
-			len(d.Machos.New), len(d.Machos.Removed), nonMainUpdated, suffix)
-	}
-
-	// Plists.
-	if d.Plists != nil {
-		suffix := ""
-		if links != nil && links.hasPlists {
-			suffix = " → [PLISTS/](./PLISTS/)"
-		}
-		fmt.Fprintf(b, "- **Plists** — %d new, %d removed, %d updated%s\n",
-			len(d.Plists.New), len(d.Plists.Removed), plistUpdatedCount(d.Plists), suffix)
-	}
-
-	// Entitlements: count "###" headers in the rendered diff (one per
-	// changed binary). The vendored DiffDatabases output uses "### " as
-	// the per-binary header.
-	if strings.TrimSpace(d.Ents) != "" {
-		entChanges := countEntChanges(d.Ents)
-		if entChanges > 0 {
-			fmt.Fprintf(b, "- **Entitlements** — %d changed (inline below)\n", entChanges)
-		} else {
-			b.WriteString("- **Entitlements** — unchanged\n")
-		}
-	}
-
-	// Provisioning.
-	if strings.TrimSpace(d.Provisioning) != "" {
-		b.WriteString("- **Provisioning profile** — changed (inline below)\n")
-	}
-
-	// Resources.
-	if d.Resources != nil {
-		suffix := ""
-		if links != nil && links.hasResources {
-			suffix = " → [RESOURCES/](./RESOURCES/)"
-		}
-		fmt.Fprintf(b, "- **Resources** — %d new, %d removed, %d text updated, %d size-only%s\n",
-			len(d.Resources.New), len(d.Resources.Removed),
-			len(d.Resources.Updated), len(d.Resources.SizeOnly), suffix)
-	}
-
-	// Hermes.
-	if d.Hermes != nil {
-		suffix := ""
-		if links != nil && links.hasHermes {
-			suffix = " → [HERMES/](./HERMES/)"
-		}
-		fmt.Fprintf(b, "- **Hermes bundles** — %d new, %d removed, %d updated%s\n",
-			len(d.Hermes.New), len(d.Hermes.Removed), len(d.Hermes.Updated), suffix)
-	}
-
-	// Plist raw-text fallback, as one line instead of per-file warnings.
-	if d.Plists != nil && len(d.Plists.Raw) > 0 {
-		fmt.Fprintf(b, "- **Raw-text plists** — %d compared as raw bytes (plist canonicalization failed; identical files are silent)\n", len(d.Plists.Raw))
-	}
-
-	if table := renderChangeSurface(d, links); table != "" {
-		b.WriteString("\n### Change Surface\n\n")
-		b.WriteString(table)
-	}
-
 	b.WriteString("\n")
 }
 
@@ -754,99 +1083,10 @@ func countEntChanges(ents string) int {
 	return count
 }
 
-func renderWarnings(b *strings.Builder, d *Diff) {
-	if len(d.Warnings) == 0 {
-		return
-	}
-	b.WriteString("## Warnings\n\n")
-	for _, warning := range d.Warnings {
-		label := warning.Section
-		if warning.Path != "" {
-			label += "/" + warning.Path
-		}
-		fmt.Fprintf(b, "- `%s` — %s\n", label, warning.Message)
-	}
-	b.WriteString("\n")
-}
-
-func renderFileTree(b *strings.Builder, d *Diff) {
-	if d.FileTree == nil {
-		return
-	}
-	if len(d.FileTree.New) == 0 && len(d.FileTree.Removed) == 0 {
-		return
-	}
-	b.WriteString("## File Tree\n\n")
-	listBlock(b, "🆕 New", d.FileTree.New)
-	listBlock(b, "❌ Removed", d.FileTree.Removed)
-}
-
-func renderEntitlements(b *strings.Builder, d *Diff) {
-	if strings.TrimSpace(d.Ents) == "" {
-		return
-	}
-	b.WriteString("## Entitlements\n\n")
-	b.WriteString(d.Ents)
-	b.WriteString("\n")
-}
-
-func renderProvisioning(b *strings.Builder, d *Diff) {
-	if strings.TrimSpace(d.Provisioning) == "" {
-		return
-	}
-	b.WriteString("## Provisioning Profile\n\n")
-	b.WriteString(d.Provisioning)
-	b.WriteString("\n\n")
-}
-
-func renderResourcesInline(b *strings.Builder, d *Diff) {
-	r := d.Resources
-	if r == nil {
-		return
-	}
-	if len(r.New) == 0 && len(r.Removed) == 0 && len(r.Updated) == 0 && len(r.SizeOnly) == 0 {
-		return
-	}
-	b.WriteString("## Resources\n\n")
-	listBlock(b, "🆕 New", r.New)
-	listBlock(b, "❌ Removed", r.Removed)
-
-	if len(r.Updated) > 0 {
-		fmt.Fprintf(b, "### ⬆️ Updated (text) (%d)\n\n", len(r.Updated))
-		keys := mapKeys(r.Updated)
-		sort.Strings(keys)
-		for _, k := range keys {
-			fmt.Fprintf(b, "<details>\n<summary><code>%s</code></summary>\n\n%s\n\n</details>\n\n", k, r.Updated[k])
-		}
-	}
-
-	if len(r.SizeOnly) > 0 {
-		b.WriteString("### 📦 Size changes (binary)\n\n")
-		keys := mapKeys(r.SizeOnly)
-		sort.Strings(keys)
-		for _, k := range keys {
-			fmt.Fprintf(b, "- `%s` — %s\n", k, r.SizeOnly[k])
-		}
-		b.WriteString("\n")
-	}
-}
-
 type resourcePage struct {
 	displayPath string
 	fileName    string
 	body        string
-}
-
-func shouldSpillResources(r *ResourcesDiff) bool {
-	if r == nil {
-		return false
-	}
-	if len(r.Updated) > spillEntryThreshold {
-		return true
-	}
-	var b strings.Builder
-	renderResourcesInline(&b, &Diff{Resources: r})
-	return b.Len() > spillByteThreshold
 }
 
 func buildResourcePages(r *ResourcesDiff) []resourcePage {

@@ -90,9 +90,12 @@ func TestRenderReadme_StatsStayNeutral(t *testing.T) {
 	d.ObjC = map[string]string{}
 	d.Swift = map[string]string{}
 
-	out := renderReadme(d, &readmeLinks{
-		hasFrameworks: true,
-	})
+	out, err := renderReadme(d, &readmeLinks{
+		binaryFiles: map[string]string{framework: "FRAMEWORKS/Foo.md"},
+	}, "")
+	if err != nil {
+		t.Fatal(err)
+	}
 
 	if strings.Contains(out, "Binary intel") {
 		t.Fatalf("README still contains binary intel rollup:\n%s", out)
@@ -100,8 +103,11 @@ func TestRenderReadme_StatsStayNeutral(t *testing.T) {
 	if strings.Contains(out, "Top binaries") {
 		t.Fatalf("README still contains top-binary rollup:\n%s", out)
 	}
-	if !strings.Contains(out, "- **Mach-Os** — 0 new, 0 removed, 1 updated → [FRAMEWORKS/](./FRAMEWORKS/)") {
-		t.Fatalf("README missing neutral Mach-O stats:\n%s", out)
+	if !strings.Contains(out, "## Frameworks\n\n#### ⬆️ Updated (1)\n\n- [Frameworks/Foo.framework/Foo](FRAMEWORKS/Foo.md)") {
+		t.Fatalf("README missing neutral Mach-O triple:\n%s", out)
+	}
+	if !strings.Contains(out, "## EOF") {
+		t.Fatalf("README missing EOF terminator:\n%s", out)
 	}
 }
 
@@ -113,11 +119,14 @@ func TestRenderReadme_RendersWarnings(t *testing.T) {
 		Message: "parse failed",
 	}}
 
-	out := renderReadme(d, nil)
+	out, err := renderReadme(d, nil, "")
+	if err != nil {
+		t.Fatal(err)
+	}
 	if !strings.Contains(out, "## Warnings") {
 		t.Fatalf("README missing warnings section:\n%s", out)
 	}
-	if !strings.Contains(out, "`plists/Broken.plist` — parse failed") {
+	if !strings.Contains(out, "`plists/Broken.plist — parse failed`") {
 		t.Fatalf("README missing warning detail:\n%s", out)
 	}
 }
@@ -470,7 +479,7 @@ echo "# Hermes" > "$out/README.md"
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !strings.Contains(string(readme), "[HERMES/](./HERMES/)") {
+	if !strings.Contains(string(readme), "[bundle diffs](HERMES/README.md)") {
 		t.Fatalf("README missing HERMES link:\n%s", string(readme))
 	}
 	if _, err := os.Stat(filepath.Join(root, "HERMES", "main_jsbundle", "manifest.json")); err != nil {
@@ -632,11 +641,11 @@ func TestWriteFiles_SpillsLargeResources(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !strings.Contains(string(readme), "[RESOURCES/](./RESOURCES/)") {
-		t.Fatalf("README missing RESOURCES link:\n%s", string(readme))
+	if !strings.Contains(string(readme), "[Resources/file-00.json](RESOURCES/Resources_file-00.json.md)") {
+		t.Fatalf("README missing per-page resource links:\n%s", string(readme))
 	}
-	if strings.Contains(string(readme), "Resources/file-00.json") {
-		t.Fatalf("README kept spilled resource details inline:\n%s", string(readme))
+	if strings.Contains(string(readme), "-old\n+new") {
+		t.Fatalf("README kept spilled resource diffs inline:\n%s", string(readme))
 	}
 	if _, err := os.Stat(filepath.Join(root, "RESOURCES", "README.md")); err != nil {
 		t.Fatalf("missing resources index: %v", err)

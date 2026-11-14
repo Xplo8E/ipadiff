@@ -29,6 +29,14 @@ type Config struct {
 	SkipResources bool
 	KeepBuildKeys bool // keep Xcode/toolchain build-metadata keys in plist diffs
 
+	// IgnoreBuildTimestamps collapses __DATE__/__TIME__/__TIMESTAMP__ cstrings
+	// to a placeholder so timestamp-only rebuild noise does not show as diffs.
+	IgnoreBuildTimestamps bool
+	// IgnoreLoadCommands skips the Mach header + load-command structural
+	// digest. Standalone IPA binaries should compare load commands (default);
+	// the knob exists for library callers diffing container-relocated images.
+	IgnoreLoadCommands bool
+
 	AllowList []string // glob filter on Mach-O section names (Seg.Section)
 	BlockList []string
 

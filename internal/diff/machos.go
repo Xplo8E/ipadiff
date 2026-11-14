@@ -17,14 +17,16 @@ import (
 // the vendored engine.
 func (d *Diff) diffMachos() error {
 	conf := &vmacho.DiffConfig{
-		Markdown:   true,
-		Color:      false,
-		DiffTool:   "git",
-		AllowList:  d.cfg.AllowList,
-		BlockList:  d.cfg.BlockList,
-		CStrings:   d.cfg.CStrings,
-		FuncStarts: d.cfg.FuncStarts,
-		Verbose:    d.cfg.Verbose,
+		Markdown:              true,
+		Color:                 false,
+		DiffTool:              "git",
+		AllowList:             d.cfg.AllowList,
+		BlockList:             d.cfg.BlockList,
+		CStrings:              d.cfg.CStrings,
+		FuncStarts:            d.cfg.FuncStarts,
+		IgnoreBuildTimestamps: d.cfg.IgnoreBuildTimestamps,
+		IgnoreLoadCommands:    d.cfg.IgnoreLoadCommands,
+		Verbose:               d.cfg.Verbose,
 	}
 
 	prev := d.collectMachos("old", d.Old, conf)

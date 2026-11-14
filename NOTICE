@@ -7,7 +7,11 @@ retain their copyright headers. A copy of the upstream ipsw license is
 preserved at `internal/vendored/LICENSE.ipsw`.
 
 Upstream ipsw commit pinned at vendor time:
-  d8aec666867becf32f904a1d6338f9e23efd55c1
+  27f1f0a5b30338fb6406e52e2c0d62f98f9ab16e (vendor refresh 2026-11-14)
+  Original vendor pin: d8aec666867becf32f904a1d6338f9e23efd55c1.
+  internal/codesign/entitlements/ (DER decode) is unchanged upstream since
+  the original pin; internal/utils/git.go and internal/commands/macho/diff.go
+  were refreshed at the new pin.
 
 Vendored package map:
   internal/vendored/ipsw_macho/        <- ipsw internal/commands/macho/
@@ -17,7 +21,8 @@ Vendored package map:
 
 Modifications to vendored code:
   - Package names changed to vmacho / vent / ventitlements / vutils
-  - Unused functions pruned (DiffIPSW, DiffFirmwares, *LowMemory in macho/diff.go;
+  - Unused functions pruned (DiffIPSW, DiffMounts, DiffFirmwares, and the gob
+    diff-info cache in macho/diff.go; Device/PemDB/SymMap symbolication plumbing;
     XCFramework/SwiftPackage in objc.go; Interface/WriteHeaders in swift.go;
     macOS/USB helpers in utils.go)
   - Import paths rewritten to point at vendored siblings

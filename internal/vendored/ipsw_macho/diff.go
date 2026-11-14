@@ -1,20 +1,32 @@
 // Package vmacho is vendored from
-// github.com/blacktop/ipsw/internal/commands/macho at commit
-// d8aec666867becf32f904a1d6338f9e23efd55c1. Pruned: dropped DiffIPSW,
-// DiffFirmwares, *LowMemory variants (and the search/signature dependencies
-// they pulled in). The remaining engine (DiffInfo, MachoDiff.Generate,
-// FormatUpdatedDiff, normalizeCStringForDiff) operates on already-opened
-// *macho.File handles supplied by the caller. Original copyright belongs to
-// blacktop; see internal/vendored/LICENSE.ipsw.
+// github.com/blacktop/ipsw/internal/commands/macho (diff.go) at commit
+// 27f1f0a5b30338fb6406e52e2c0d62f98f9ab16e. Pruned: dropped DiffIPSW,
+// DiffMounts, DiffFirmwares, the LowMemory gob cache (WriteCachedDiffInfo /
+// ReadCachedDiffInfo), and the Device/PemDB/SymMap (signature.SymbolMap)
+// symbolication plumbing; the engine operates on already-opened *macho.File
+// handles supplied by the caller. ipadiff additions kept: DiffInfo.Encrypted
+// and GenerateDiffInfoDegraded for FairPlay-encrypted binaries — encrypted
+// segments are excluded from section content hashing as well as symbol and
+// cstring extraction, because ciphertext changes on every rebuild.
+// Original copyright belongs to blacktop; see internal/vendored/LICENSE.ipsw.
 package vmacho
 
 import (
+	"bufio"
+	"bytes"
+	"crypto/sha256"
+	"encoding/binary"
+	"encoding/hex"
 	"fmt"
+	"hash"
+	"io"
 	"maps"
+	"math/bits"
 	"regexp"
 	"slices"
 	"sort"
 	"strings"
+	"sync"
 
 	"github.com/blacktop/go-macho"
 	"github.com/blacktop/go-macho/types"
@@ -22,96 +34,454 @@ import (
 	vutils "github.com/Xplo8E/ipadiff/internal/vendored/ipsw_utils"
 )
 
-// xbsTemporaryBuildPathRE collapses build-server temp paths so they don't
-// dominate the cstring diff with noise.
-var xbsTemporaryBuildPathRE = regexp.MustCompile(`^/Library/Caches/com\.apple\.xbs/[0-9A-Fa-f]{8}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{12}/TemporaryDirectory\.[^/\s]+`)
+// hashStreamBufSize is the streaming read size, and also the point at which
+// bufio.Scanner refills in the normalized CString hashers.
+const hashStreamBufSize = 32 * 1024
 
-const xbsTemporaryBuildPathPlaceholder = "/Library/Caches/com.apple.xbs/<UUID>/TemporaryDirectory.<TMP>"
+// hashStreamPool reuses sha256 hashers and copy buffers across the many
+// per-section hashes a single GenerateDiffInfo computes, so section content is
+// hashed incrementally instead of slurped whole into a []byte (Section.Data was
+// the dominant cold-path allocation: ~71% of alloc-space and most of the
+// alloc-count).
+var hashStreamPool = sync.Pool{New: func() any {
+	return &hashStream{h: sha256.New(), buf: make([]byte, hashStreamBufSize)}
+}}
 
-func normalizeCStringForDiff(value string) string {
-	return xbsTemporaryBuildPathRE.ReplaceAllString(value, xbsTemporaryBuildPathPlaceholder)
+type hashStream struct {
+	h   hash.Hash
+	buf []byte
 }
 
-func normalizeCStringsForDiff(values []string) []string {
+// streamSHA256 hashes r incrementally and returns the hex digest. ok is false
+// when r yields no bytes or errors before any data, matching the previous
+// "empty data -> no hash" behavior of the slurp-based hashers.
+func streamSHA256(r io.Reader) (string, bool) {
+	hs := hashStreamPool.Get().(*hashStream)
+	defer hashStreamPool.Put(hs)
+	hs.h.Reset()
+	n, err := io.CopyBuffer(hs.h, r, hs.buf)
+	if err != nil || n == 0 {
+		return "", false
+	}
+	var sum [sha256.Size]byte
+	return hex.EncodeToString(hs.h.Sum(sum[:0])), true
+}
+
+// xbsBuildUUIDRE matches the per-build XBS job UUID directory. It is
+// intentionally NOT anchored: these paths appear both as a whole symbol/string
+// value AND embedded mid-string (e.g. inside a libmalloc assertion message:
+// `... failed (/Library/Caches/com.apple.xbs/<UUID>/TemporaryDirectory.<TMP>/
+// Sources/.../file.c:114)`), and both forms churn every build.
+var xbsBuildUUIDRE = regexp.MustCompile(`/Library/Caches/com\.apple\.xbs/[0-9A-Fa-f]{8}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{12}(/|$)`)
+
+const xbsBuildUUIDPlaceholder = "/Library/Caches/com.apple.xbs/<UUID>"
+const xbsBuildUUIDReplacement = xbsBuildUUIDPlaceholder + "${1}"
+
+// xbsTemporaryDirectoryRE matches the mkdtemp-rotated `TemporaryDirectory.<TOK>`
+// path component on its own rather than as a suffix of xbsBuildUUIDRE, because
+// the two rotate independently and appear in more than one combination:
+//
+//	/Library/Caches/com.apple.xbs/<UUID>/TemporaryDirectory.<TOK>/Sources/...
+//	/AppleInternal/Library/BuildRoots/<ROOT>/Library/Caches/com.apple.xbs/TemporaryDirectory.<TOK>/Sources/...
+//
+// It is deliberately narrow, because collapsing a token that is NOT a build
+// temp dir would make two genuinely different paths compare equal:
+//
+//   - the XBS prefix is required, so `/tmp/TemporaryDirectory.alpha/x` and a
+//     source file named `.../TemporaryDirectory.h` are left alone;
+//   - the token is exactly the six characters mkdtemp substitutes for XXXXXX,
+//     so a real extension cannot be swallowed;
+//   - a trailing `/` or end-of-string is required, so the match covers a whole
+//     path component.
+//
+// It runs after xbsBuildUUIDRE, hence the literal `<UUID>` in the optional
+// group.
+var xbsTemporaryDirectoryRE = regexp.MustCompile(`(/Library/Caches/com\.apple\.xbs(?:/<UUID>)?)/TemporaryDirectory\.[A-Za-z0-9]{6}(/|$)`)
+
+const xbsTemporaryDirectoryReplacement = "${1}/TemporaryDirectory.<TMP>${2}"
+
+// appleInternalBuildRootRE matches the per-build rotating token in an
+// /AppleInternal/Library/BuildRoots/<token>/... path (the meaningful SDK/path
+// suffix is kept). Also unanchored, for the same embedded-in-a-longer-string
+// reason as xbsBuildUUIDRE.
+var appleInternalBuildRootRE = regexp.MustCompile(`/AppleInternal/Library/BuildRoots/[^/\s]+`)
+
+const appleInternalBuildRootPlaceholder = "/AppleInternal/Library/BuildRoots/<BUILDROOT>"
+
+// normalizeBuildPathForDiff collapses every occurrence of the two per-build
+// rotating build-root paths Apple embeds in Mach-O strings and object-file
+// (debug-map) symbols so a rebuild of identical source does not show as a diff.
+func normalizeBuildPathForDiff(value string) string {
+	// Every pattern below is rooted at a '/', so a value without one cannot
+	// match any of them. The gate matters because this runs over every symbol
+	// and every cstring of both sides in DiffInfo.Equivalent: regexp allocates
+	// even when it does not match, so three unconditional passes cost ~9
+	// allocations per string, and ~99% of strings hold no path at all.
+	if !strings.ContainsRune(value, '/') {
+		return value
+	}
+	value = xbsBuildUUIDRE.ReplaceAllString(value, xbsBuildUUIDReplacement)
+	value = xbsTemporaryDirectoryRE.ReplaceAllString(value, xbsTemporaryDirectoryReplacement)
+	return appleInternalBuildRootRE.ReplaceAllString(value, appleInternalBuildRootPlaceholder)
+}
+
+func normalizeCStringForDiff(value string) string {
+	return normalizeBuildPathForDiff(value)
+}
+
+// compilerBuildTimestampRE matches whole CString forms produced from
+// __DATE__, __TIME__, __TIMESTAMP__, and Apple's timezone-bearing equivalent.
+// Anchoring is intentional: a timestamp inside a diagnostic or other
+// meaningful string must remain reportable.
+const (
+	compilerMonthPattern   = `(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)`
+	compilerWeekdayPattern = `(?:Sun|Mon|Tue|Wed|Thu|Fri|Sat)`
+	compilerDayPattern     = `(?: [1-9]|[12][0-9]|3[01])`
+	compilerTimePattern    = `(?:[01][0-9]|2[0-3]):[0-5][0-9]:[0-5][0-9]`
+)
+
+var compilerBuildTimestampRE = regexp.MustCompile(
+	`^(?:` +
+		compilerTimePattern + `|` +
+		compilerMonthPattern + ` ` + compilerDayPattern + ` [0-9]{4}(?:(?: |, )?` + compilerTimePattern + `)?|` +
+		compilerWeekdayPattern + ` ` + compilerMonthPattern + ` ` + compilerDayPattern + ` ` + compilerTimePattern + `(?: [A-Z]{2,5})? [0-9]{4}` +
+		`)$`,
+)
+
+const compilerBuildTimestampPlaceholder = "<BUILD_TIMESTAMP>"
+
+func normalizeCStringForDiffIgnoringBuildTimestamp(value string) string {
+	if compilerBuildTimestampRE.MatchString(value) {
+		return compilerBuildTimestampPlaceholder
+	}
+	return normalizeCStringForDiff(value)
+}
+
+func cstringNormalizer(ignoreBuildTimestamps bool) func(string) string {
+	if ignoreBuildTimestamps {
+		return normalizeCStringForDiffIgnoringBuildTimestamp
+	}
+	return normalizeCStringForDiff
+}
+
+// normalizeSymbolForDiff collapses build-root path churn and strips the
+// trailing generated disambiguator counter so recompiled-but-unchanged local
+// symbols cancel in the diff instead of flooding it with renumber noise.
+func normalizeSymbolForDiff(value string) string {
+	value = normalizeBuildPathForDiff(value)
+	if !mayEndInGeneratedCounter(value) {
+		return value
+	}
+	for {
+		if strings.HasSuffix(value, ".cold") {
+			value = value[:len(value)-len(".cold")]
+			continue
+		}
+		i := len(value)
+		for i > 0 && value[i-1] >= '0' && value[i-1] <= '9' {
+			i--
+		}
+		if i == len(value) || i == 0 || value[i-1] != '.' {
+			return value
+		}
+		value = value[:i-1]
+	}
+}
+
+// mayEndInGeneratedCounter reports whether value can match
+// generatedSymbolCounterRE: every match ends in ".cold" or an ASCII digit.
+// Most symbols end in neither, and the regexp allocates even when it does not
+// match.
+func mayEndInGeneratedCounter(value string) bool {
+	if value == "" {
+		return false
+	}
+	last := value[len(value)-1]
+	return ('0' <= last && last <= '9') || strings.HasSuffix(value, ".cold")
+}
+
+func normalizeSymbolsForDiff(values []string) []string {
 	if len(values) == 0 {
 		return nil
 	}
 	normalized := make([]string, len(values))
 	for idx, value := range values {
-		normalized[idx] = normalizeCStringForDiff(value)
+		normalized[idx] = normalizeSymbolForDiff(value)
 	}
 	return normalized
 }
 
-func diffNormalizedCStrings(oldValues, newValues []string) ([]string, []string) {
-	normalizedOldValues := normalizeCStringsForDiff(oldValues)
-	normalizedNewValues := normalizeCStringsForDiff(newValues)
+// diffNormalizedSymbols returns sorted, deduplicated additions and removals
+// after collapsing build-root paths and generated counters.
+func diffNormalizedSymbols(oldValues, newValues []string) ([]string, []string) {
+	return diffNormalizedSets(oldValues, newValues, normalizeSymbolForDiff)
+}
 
-	added := vutils.Difference(normalizedNewValues, normalizedOldValues)
+// diffNormalizedSets records membership in both sides without materializing
+// normalized slices. Keeping shared entries prevents duplicates from becoming
+// false additions or removals after normalization.
+func diffNormalizedSets(oldValues, newValues []string, normalize func(string) string) (added, removed []string) {
+	const oldSide, newSide uint8 = 1, 2
+	membership := make(map[string]uint8, len(oldValues)+len(newValues))
+	for _, value := range oldValues {
+		membership[normalize(value)] = oldSide
+	}
+	for _, value := range newValues {
+		key := normalize(value)
+		membership[key] |= newSide
+	}
+	for value, sides := range membership {
+		switch sides {
+		case oldSide:
+			removed = append(removed, value)
+		case newSide:
+			added = append(added, value)
+		}
+	}
 	sort.Strings(added)
-	removed := vutils.Difference(normalizedOldValues, normalizedNewValues)
 	sort.Strings(removed)
-
 	return added, removed
 }
 
-// DiffImports returns sorted (added, removed) sets across two DiffInfos'
-// Imports lists. Safe with nil inputs (treated as empty).
-func DiffImports(oldI, newI *DiffInfo) (added, removed []string) {
-	return setDiff(infoImports(newI), infoImports(oldI))
-}
-
-// DiffCStringsTyped returns sorted (added, removed) sets across the
-// cstring lists of two DiffInfos, after the same XBS path normalization
-// that FormatUpdatedDiff uses. Safe with nil inputs (treated as empty).
-func DiffCStringsTyped(oldI, newI *DiffInfo) (added, removed []string) {
-	return diffNormalizedCStrings(infoCStrings(oldI), infoCStrings(newI))
-}
-
-// DiffSymbols returns sorted (added, removed) sets across the symbol
-// lists of two DiffInfos. Safe with nil inputs (treated as empty).
-func DiffSymbols(oldI, newI *DiffInfo) (added, removed []string) {
-	return setDiff(infoSymbols(newI), infoSymbols(oldI))
-}
-
-func setDiff(a, b []string) (added, removed []string) {
-	added = vutils.Difference(a, b)
-	sort.Strings(added)
-	removed = vutils.Difference(b, a)
-	sort.Strings(removed)
-	return
-}
-
-func infoImports(i *DiffInfo) []string {
-	if i == nil {
+func normalizeCStringsForDiff(values []string, ignoreBuildTimestamps bool) []string {
+	if len(values) == 0 {
 		return nil
 	}
-	return i.Imports
+
+	normalize := cstringNormalizer(ignoreBuildTimestamps)
+	normalized := make([]string, len(values))
+	for idx, value := range values {
+		normalized[idx] = normalize(value)
+	}
+	return normalized
 }
 
-func infoCStrings(i *DiffInfo) []string {
-	if i == nil {
-		return nil
-	}
-	return i.CStrings
+func diffNormalizedCStrings(oldValues, newValues []string, ignoreBuildTimestamps bool) ([]string, []string) {
+	return diffNormalizedSets(oldValues, newValues, cstringNormalizer(ignoreBuildTimestamps))
 }
 
-func infoSymbols(i *DiffInfo) []string {
-	if i == nil {
-		return nil
+// FormatUpdatedDiff formats a single-file diff in the same style as MachoDiff.Generate.
+// Returns an empty string if no printable diff content is produced.
+func FormatUpdatedDiff(oldInfo, newInfo *DiffInfo, conf *DiffConfig) (string, error) {
+	if oldInfo == nil || newInfo == nil {
+		return "", fmt.Errorf("nil diff info")
 	}
-	return i.Symbols
+
+	out, err := vutils.GitDiff(oldInfo.stringForDiff(conf)+"\n", newInfo.stringForDiff(conf)+"\n", &vutils.GitDiffConfig{Color: conf.Color, Tool: conf.DiffTool})
+	if err != nil {
+		return "", err
+	}
+
+	var b strings.Builder
+	hasDiffRows := containsAddedOrRemovedRows(out)
+	if len(out) > 0 {
+		b.WriteString(out)
+	}
+
+	sectionChanges := sectionContentChanges(oldInfo, newInfo)
+	if len(sectionChanges) > 0 && !conf.Markdown {
+		b.WriteString("Sections with same size but changed content:\n")
+		for _, name := range sectionChanges {
+			b.WriteString(fmt.Sprintf("- %s\n", name))
+		}
+	}
+
+	// Symbols
+	newSyms, rmSyms := diffNormalizedSymbols(oldInfo.Symbols, newInfo.Symbols)
+	if len(newSyms) > 0 || len(rmSyms) > 0 {
+		hasDiffRows = true
+		b.WriteString("Symbols:\n")
+		for _, s := range newSyms {
+			b.WriteString(fmt.Sprintf("+ %s\n", s))
+		}
+		for _, s := range rmSyms {
+			b.WriteString(fmt.Sprintf("- %s\n", s))
+		}
+	}
+
+	// Functions
+	if conf.FuncStarts {
+		printable := func(f types.Function, smap map[uint64]string) string {
+			sym, ok := smap[f.StartAddr]
+			if ok {
+				return sym
+			}
+			return fmt.Sprintf("sub_%x", f.StartAddr)
+		}
+
+		funcs1 := oldInfo.Starts
+		funcs2 := newInfo.Starts
+		n1, n2 := len(funcs1), len(funcs2)
+
+		var fb strings.Builder
+
+		if n1 == n2 {
+			consecutiveMismatch := 0
+			const maxMismatch = 5
+
+			for i := range n1 {
+				f1 := funcs1[i]
+				f2 := funcs2[i]
+				f1.Name = printable(f1, oldInfo.SymbolMap)
+				f2.Name = printable(f2, newInfo.SymbolMap)
+
+				if f1.Name != "" && f1.Name == f2.Name {
+					sz1 := f1.EndAddr - f1.StartAddr
+					sz2 := f2.EndAddr - f2.StartAddr
+					if sz1 != sz2 {
+						fb.WriteString(fmt.Sprintf("~ %s : %d -> %d\n", f1.Name, sz1, sz2))
+					}
+					consecutiveMismatch = 0
+					continue
+				}
+
+				sz1 := f1.EndAddr - f1.StartAddr
+				sz2 := f2.EndAddr - f2.StartAddr
+
+				if sz1 == sz2 {
+					consecutiveMismatch = 0
+					continue
+				}
+
+				fb.WriteString(fmt.Sprintf("~ %s -> %s : %d -> %d\n", f1.Name, f2.Name, sz1, sz2))
+				consecutiveMismatch++
+
+				if consecutiveMismatch >= maxMismatch {
+					recovered := false
+					const seekAhead = 6
+					if i+seekAhead < n1 {
+						matches := 0
+						for k := 1; k <= seekAhead && i+k < n1; k++ {
+							if (funcs1[i+k].EndAddr - funcs1[i+k].StartAddr) == (funcs2[i+k].EndAddr - funcs2[i+k].StartAddr) {
+								matches++
+								if matches >= 3 {
+									recovered = true
+									break
+								}
+							} else {
+								matches = 0
+							}
+						}
+					}
+					if !recovered {
+						fb.Reset()
+						break
+					}
+				}
+			}
+		} else {
+			i, j := 0, 0
+			consecutiveNoise := 0
+			const noiseLimit = 6
+
+			for i < n1 && j < n2 {
+				f1 := funcs1[i]
+				f2 := funcs2[j]
+				f1.Name = printable(f1, oldInfo.SymbolMap)
+				f2.Name = printable(f2, newInfo.SymbolMap)
+				if f1.Name != "" && f1.Name == f2.Name {
+					sz1 := f1.EndAddr - f1.StartAddr
+					sz2 := f2.EndAddr - f2.StartAddr
+					if sz1 != sz2 {
+						fb.WriteString(fmt.Sprintf("~ %s : %d -> %d\n", f1.Name, sz1, sz2))
+					}
+					i++
+					j++
+					consecutiveNoise = 0
+					continue
+				}
+
+				if (f1.EndAddr - f1.StartAddr) == (f2.EndAddr - f2.StartAddr) {
+					i++
+					j++
+					consecutiveNoise = 0
+					continue
+				}
+
+				if j+1 < n2 && (f1.EndAddr-f1.StartAddr) == (funcs2[j+1].EndAddr-funcs2[j+1].StartAddr) {
+					fb.WriteString(fmt.Sprintf("+ %s\n", f2.Name))
+					j++
+					consecutiveNoise++
+				} else if i+1 < n1 && (funcs1[i+1].EndAddr-funcs1[i+1].StartAddr) == (f2.EndAddr-f2.StartAddr) {
+					fb.WriteString(fmt.Sprintf("- %s\n", f1.Name))
+					i++
+					consecutiveNoise++
+				} else {
+					consecutiveNoise++
+				}
+
+				if consecutiveNoise >= noiseLimit {
+					fb.Reset()
+					break
+				}
+			}
+		}
+
+		hasDiffRows = hasDiffRows || containsAddedOrRemovedRows(fb.String())
+		appendFunctionSummary(&b, &fb)
+	}
+
+	// CStrings
+	if conf.CStrings {
+		newStrs, rmStrs := diffNormalizedCStrings(oldInfo.CStrings, newInfo.CStrings, conf.IgnoreBuildTimestamps)
+		if len(newStrs) > 0 || len(rmStrs) > 0 {
+			hasDiffRows = true
+			b.WriteString("CStrings:\n")
+			for _, s := range newStrs {
+				b.WriteString(fmt.Sprintf("+ %#v\n", s))
+			}
+			for _, s := range rmStrs {
+				b.WriteString(fmt.Sprintf("- %#v\n", s))
+			}
+		}
+	}
+
+	if b.Len() == 0 && len(sectionChanges) == 0 {
+		return "", nil
+	}
+	if !conf.Markdown {
+		return b.String(), nil
+	}
+
+	var md strings.Builder
+	if oldInfo.Encrypted || newInfo.Encrypted {
+		md.WriteString("> ⚠️ encrypted: structural diff only (sections/imports)\n\n")
+	}
+	if len(sectionChanges) > 0 {
+		md.WriteString("### Sections with Same Size but Changed Content\n\n")
+		for _, name := range sectionChanges {
+			md.WriteString(fmt.Sprintf("- `%s`\n", name))
+		}
+	}
+	if b.Len() == 0 {
+		return md.String(), nil
+	}
+	if md.Len() > 0 {
+		md.WriteByte('\n')
+	}
+	fence := "text"
+	if hasDiffRows {
+		fence = "diff"
+	}
+	body := b.String()
+	if !strings.HasSuffix(body, "\n") {
+		body += "\n"
+	}
+	md.WriteString("```" + fence + "\n" + body + "```\n")
+	return md.String(), nil
 }
 
 type DiffConfig struct {
-	Markdown   bool
-	Color      bool
-	DiffTool   string
-	AllowList  []string
-	BlockList  []string
-	CStrings   bool
-	FuncStarts bool
-	Verbose    bool
+	Markdown              bool
+	Color                 bool
+	DiffTool              string
+	AllowList             []string
+	BlockList             []string
+	CStrings              bool
+	FuncStarts            bool
+	IgnoreBuildTimestamps bool
+	IgnoreLoadCommands    bool
+	Verbose               bool
 }
 
 type MachoDiff struct {
@@ -121,48 +491,62 @@ type MachoDiff struct {
 }
 
 type section struct {
-	Name string `json:"name,omitempty"`
-	Size uint64 `json:"size,omitempty"`
+	Name     string            `json:"name,omitempty"`
+	Size     uint64            `json:"size,omitempty"`
+	Hash     string            `json:"hash,omitempty"`
+	Type     types.SectionFlag `json:"-"`
+	HashMode sectionHashMode   `json:"-"`
 }
 
 type DiffInfo struct {
-	Version   string
-	UUID      string
-	Imports   []string
-	Sections  []section
-	Functions int
-	Starts    []types.Function
-	Symbols   []string
-	CStrings  []string
-	SymbolMap map[uint64]string
-	Verbose   bool
+	Version     string
+	UUID        string
+	LoadCmdHash string // internal structural digest; not rendered in reports
+	Imports     []string
+	Sections    []section
+	Functions   int
+	Starts      []types.Function
+	Symbols     []string
+	CStrings    []string
+	SymbolMap   map[uint64]string
+	Verbose     bool
 
 	// Encrypted marks binaries with FairPlay (LC_ENCRYPTION_INFO.CryptID != 0).
-	// When true, GenerateDiffInfo skips symbol/cstring extraction (those segments
-	// are unreadable). Set externally before calling FormatUpdatedDiff.
+	// When true, GenerateDiffInfoDegraded skips symbol/cstring extraction and
+	// section content hashing (those segments are unreadable ciphertext).
+	// Set externally before calling Equivalent / FormatUpdatedDiff.
 	Encrypted bool
 }
 
-// GenerateDiffInfo extracts a structural fingerprint from a Mach-O.
-// For encrypted binaries (FairPlay), pass conf with CStrings=false and
-// FuncStarts=false, or use GenerateDiffInfoDegraded.
+// GenerateDiffInfo generates diff information for a standalone Mach-O, whose
+// non-code section bytes are meaningful without container relocation context.
 func GenerateDiffInfo(m *macho.File, conf *DiffConfig) *DiffInfo {
+	return generateDiffInfo(m, conf, false)
+}
+
+// GenerateContainerDiffInfo generates diff information for an image whose
+// relocations are owned by a shared cache or fileset container. ipadiff never
+// calls it (IPA binaries are standalone); kept for upstream fidelity.
+func GenerateContainerDiffInfo(m *macho.File, conf *DiffConfig) *DiffInfo {
+	return generateDiffInfo(m, conf, true)
+}
+
+func generateDiffInfo(m *macho.File, conf *DiffConfig, containerImage bool) *DiffInfo {
+	compareAllContent := !containerImage || len(conf.AllowList) > 0
 	var secs []section
 	for _, s := range m.Sections {
-		if len(conf.AllowList) > 0 {
-			if !slices.Contains(conf.AllowList, s.Seg+"."+s.Name) {
-				continue
-			}
+		name := s.Seg + "." + s.Name
+		if !sectionIncluded(name, conf) {
+			continue
 		}
-		if len(conf.BlockList) > 0 {
-			if slices.Contains(conf.BlockList, s.Seg+"."+s.Name) {
-				continue
-			}
+		sec := section{
+			Name:     name,
+			Size:     s.Size,
+			Type:     s.Flags & types.SectionType,
+			HashMode: sectionContentHashMode(s, compareAllContent),
 		}
-		secs = append(secs, section{
-			Name: s.Seg + "." + s.Name,
-			Size: s.Size,
-		})
+		sec.Hash, _ = sectionContentHashWithMode(s, sec.HashMode, conf.IgnoreBuildTimestamps)
+		secs = append(secs, sec)
 	}
 	var starts []types.Function
 	if fns := m.GetFunctions(); fns != nil {
@@ -205,62 +589,658 @@ func GenerateDiffInfo(m *macho.File, conf *DiffConfig) *DiffInfo {
 			slices.Sort(strs)
 		}
 	}
+	var loadCmdHash string
+	if !conf.IgnoreLoadCommands {
+		loadCmdHash = loadCommandsHash(m, conf)
+	}
 	return &DiffInfo{
-		Version:   sourceVersion,
-		UUID:      uuidStr,
-		Imports:   m.ImportedLibraries(),
-		Sections:  secs,
-		Functions: len(starts),
-		Starts:    starts,
-		Symbols:   syms,
-		CStrings:  strs,
-		SymbolMap: smap,
-		Verbose:   conf.Verbose,
+		Version:     sourceVersion,
+		UUID:        uuidStr,
+		LoadCmdHash: loadCmdHash,
+		Imports:     m.ImportedLibraries(),
+		Sections:    secs,
+		Functions:   len(starts),
+		Starts:      starts,
+		Symbols:     syms,
+		CStrings:    strs,
+		SymbolMap:   smap,
+		Verbose:     conf.Verbose,
 	}
 }
 
 // GenerateDiffInfoDegraded builds a DiffInfo from an encrypted Mach-O,
 // covering only the parts that are still readable (sections, imports,
-// function starts table) and skipping anything that requires reading
-// encrypted segments (symbols, cstrings).
+// function starts table, load commands) and skipping anything that requires
+// reading encrypted segments (symbols, cstrings). Section content hashing is
+// disabled as well: encrypted segment bytes are ciphertext, so their digest
+// changes on every rebuild and would report every re-signed build as changed.
 func GenerateDiffInfoDegraded(m *macho.File, conf *DiffConfig) *DiffInfo {
 	degraded := *conf
 	degraded.CStrings = false
 	degraded.FuncStarts = false
-	info := GenerateDiffInfo(m, &degraded)
+	info := generateDiffInfo(m, &degraded, false)
+	for idx := range info.Sections {
+		info.Sections[idx].Hash = ""
+		info.Sections[idx].HashMode = hashSkip
+	}
 	info.Encrypted = true
 	return info
 }
 
-// Equal performs a cheap structural equality check.
-func (i DiffInfo) Equal(x DiffInfo) bool {
-	if len(i.Imports) != len(x.Imports) {
-		return false
+// loadCommandsHash returns a digest of the Mach header and load commands with
+// volatile build metadata and linkedit positions removed. When section filters
+// are active, segment commands are represented canonically so excluded sections
+// and address/offset shifts cannot bypass the filter.
+//
+// Returns "" when the load commands can't be rebuilt; callers should treat an
+// empty hash as "not available" and skip the LoadCmdHash leg of the comparison.
+func loadCommandsHash(m *macho.File, conf *DiffConfig) string {
+	if m == nil || m.SizeCommands == 0 {
+		return ""
 	}
-	for i, imp := range i.Imports {
-		if imp != x.Imports[i] {
-			return false
+	buf, hdrSize := loadCommandsRegion(m)
+	if buf == nil {
+		return ""
+	}
+	return loadCommandsDigest(buf, hdrSize, m.Loads, m.Sections, conf)
+}
+
+// loadCommandsRegion rebuilds the Mach header and load commands as they appear
+// on disk from the parsed header and each command's raw bytes. Reading them
+// back with m.ReadAt(buf, 0) would go through the reader of an enclosing
+// fileset or dyld_shared_cache, whose offset 0 is not this image's header. Each
+// command is sized by its own cmdsize field rather than Load.LoadSize, which
+// go-macho reports as 8 for LC_THREAD/LC_UNIXTHREAD. It returns nil when the
+// parsed commands don't cover SizeCommands.
+func loadCommandsRegion(m *macho.File) ([]byte, int) {
+	hdrSize := 28
+	if m.Magic == types.Magic64 {
+		hdrSize = 32
+	}
+	buf := make([]byte, hdrSize, hdrSize+int(m.SizeCommands))
+	bo := m.ByteOrder
+	bo.PutUint32(buf[0:], uint32(m.Magic))
+	bo.PutUint32(buf[4:], uint32(m.CPU))
+	bo.PutUint32(buf[8:], uint32(m.SubCPU))
+	bo.PutUint32(buf[12:], uint32(m.Type))
+	bo.PutUint32(buf[16:], m.NCommands)
+	bo.PutUint32(buf[20:], m.SizeCommands)
+	bo.PutUint32(buf[24:], uint32(m.Flags))
+	if hdrSize == 32 {
+		bo.PutUint32(buf[28:], m.Reserved)
+	}
+	for _, l := range m.Loads {
+		raw := l.Raw()
+		if len(raw) < 8 || int(bo.Uint32(raw[4:8])) != len(raw) {
+			return nil, 0
+		}
+		buf = append(buf, raw...)
+	}
+	if len(buf) != hdrSize+int(m.SizeCommands) {
+		return nil, 0
+	}
+	return buf, hdrSize
+}
+
+// loadCommandsDigest hashes the header + load-command region with volatile
+// fields zeroed. With an allow- or block-list, raw segment commands are replaced
+// by a policy-aware representation produced by writeFilteredSegmentDigest.
+// Commands are walked by the length of their raw bytes, the boundaries
+// loadCommandsRegion checks against cmdsize, not by Load.LoadSize.
+func loadCommandsDigest(buf []byte, hdrSize int, loads []macho.Load, sections []*types.Section, conf *DiffConfig) string {
+	off := hdrSize
+	for _, l := range loads {
+		sz := len(l.Raw())
+		if sz <= 0 || off+sz > len(buf) {
+			break
+		}
+		for _, r := range volatileLoadCmdRanges(l.Command(), sz) {
+			start, end := off+r[0], off+r[1]
+			if start < off+8 { // never touch the cmd/cmdsize header
+				start = off + 8
+			}
+			if end > off+sz {
+				end = off + sz
+			}
+			clear(buf[start:end])
+		}
+		off += sz
+	}
+
+	filtered := conf != nil && (len(conf.AllowList) > 0 || len(conf.BlockList) > 0)
+	if !filtered {
+		sum := sha256.Sum256(buf)
+		return hex.EncodeToString(sum[:])
+	}
+
+	// sizeofcmds includes every raw section record, including blocked ones.
+	// The canonical command stream below already carries its own boundaries.
+	if hdrSize >= 24 {
+		clear(buf[20:24])
+	}
+	h := sha256.New()
+	_, _ = h.Write(buf[:hdrSize])
+	off = hdrSize
+	for _, l := range loads {
+		sz := len(l.Raw())
+		if sz <= 0 || off+sz > len(buf) {
+			break
+		}
+		if l.Command() == types.LC_SEGMENT || l.Command() == types.LC_SEGMENT_64 {
+			if seg, ok := l.(*macho.Segment); ok {
+				writeFilteredSegmentDigest(h, seg, sections, conf)
+				off += sz
+				continue
+			}
+		}
+		_, _ = h.Write(buf[off : off+sz])
+		off += sz
+	}
+	return hex.EncodeToString(h.Sum(nil))
+}
+
+// writeFilteredSegmentDigest retains structural segment data while omitting
+// excluded sections and positions derived from section layout. Included section
+// sizes and selected content hashes are compared separately in DiffInfo.Sections,
+// but flags, alignment, relocation counts, and section-type-specific reserved
+// fields still need representation here.
+func writeFilteredSegmentDigest(h hash.Hash, seg *macho.Segment, sections []*types.Section, conf *DiffConfig) {
+	var lane [8]byte
+	writeUint32 := func(value uint32) {
+		binary.LittleEndian.PutUint32(lane[:4], value)
+		_, _ = h.Write(lane[:4])
+	}
+	writeUint64 := func(value uint64) {
+		binary.LittleEndian.PutUint64(lane[:], value)
+		_, _ = h.Write(lane[:])
+	}
+	writeName := func(value string) {
+		var name [16]byte
+		copy(name[:], value)
+		_, _ = h.Write(name[:])
+	}
+
+	writeUint32(uint32(seg.Command()))
+	writeName(seg.Name)
+	writeUint32(uint32(seg.Maxprot))
+	writeUint32(uint32(seg.Prot))
+	writeUint32(uint32(seg.Flag))
+	// __PAGEZERO has no sections, so its guard size has no other semantic
+	// representation. Other segment positions are derived from section layout.
+	if seg.Name == "__PAGEZERO" {
+		writeUint64(seg.Addr)
+		writeUint64(seg.Memsz)
+		writeUint64(seg.Offset)
+		writeUint64(seg.Filesz)
+	}
+
+	start := uint64(seg.Firstsect)
+	end := min(start+uint64(seg.Nsect), uint64(len(sections)))
+	var included uint32
+	for idx := start; idx < end; idx++ {
+		s := sections[idx]
+		if s != nil && sectionIncluded(s.Seg+"."+s.Name, conf) {
+			included++
 		}
 	}
-	if len(i.Sections) != len(x.Sections) {
+	writeUint32(included)
+	for idx := start; idx < end; idx++ {
+		s := sections[idx]
+		if s == nil || !sectionIncluded(s.Seg+"."+s.Name, conf) {
+			continue
+		}
+		writeName(s.Seg)
+		writeName(s.Name)
+		writeUint64(s.Size)
+		writeUint32(s.Align)
+		writeUint32(s.Nreloc)
+		writeUint32(uint32(s.Flags))
+		writeUint32(s.Reserved1)
+		writeUint32(s.Reserved2)
+		writeUint32(s.Reserved3)
+	}
+}
+
+// volatileLoadCmdRanges returns the byte ranges (relative to the start of a
+// load command of the given type and size) whose contents are build metadata
+// or linkedit position rather than structural identity, and so are zeroed
+// before hashing. Offsets follow the Mach-O load_command layouts; the 8-byte
+// cmd/cmdsize header is never included. Anything not listed here (segments,
+// LC_RPATH, LC_MAIN, encryption info, ...) is hashed verbatim.
+func volatileLoadCmdRanges(cmd types.LoadCmd, sz int) [][2]int {
+	switch cmd {
+	case types.LC_UUID:
+		return [][2]int{{8, 24}} // the 16-byte UUID
+	case types.LC_SOURCE_VERSION:
+		return [][2]int{{8, 16}} // version uint64
+	case types.LC_BUILD_VERSION:
+		return [][2]int{{12, sz}} // keep platform; drop minos/sdk/ntools/tools
+	case types.LC_VERSION_MIN_MACOSX, types.LC_VERSION_MIN_IPHONEOS,
+		types.LC_VERSION_MIN_TVOS, types.LC_VERSION_MIN_WATCHOS:
+		return [][2]int{{8, 16}} // version + sdk
+	case types.LC_LOAD_DYLIB, types.LC_ID_DYLIB, types.LC_LOAD_WEAK_DYLIB,
+		types.LC_REEXPORT_DYLIB, types.LC_LAZY_LOAD_DYLIB, types.LC_LOAD_UPWARD_DYLIB:
+		// Keep name_offset[8:12] and the name string[24:]; drop timestamp +
+		// current_version + compatibility_version so a dependency's version
+		// bump is ignored but adding/removing/renaming one still flips.
+		return [][2]int{{12, 24}}
+	case types.LC_CODE_SIGNATURE, types.LC_FUNCTION_STARTS, types.LC_DATA_IN_CODE,
+		types.LC_DYLD_EXPORTS_TRIE, types.LC_DYLD_CHAINED_FIXUPS, types.LC_SEGMENT_SPLIT_INFO,
+		types.LC_DYLIB_CODE_SIGN_DRS, types.LC_LINKER_OPTIMIZATION_HINT:
+		return [][2]int{{8, 16}} // linkedit_data_command dataoff + datasize
+	case types.LC_DYLD_INFO, types.LC_DYLD_INFO_ONLY:
+		return [][2]int{{8, 48}} // 5 (offset,size) pairs into linkedit
+	case types.LC_SYMTAB:
+		return [][2]int{{8, 24}} // symoff, nsyms, stroff, strsize
+	case types.LC_DYSYMTAB:
+		return [][2]int{{8, sz}} // all index/offset fields are linkedit position
+	}
+	return nil
+}
+
+func sectionIncluded(name string, conf *DiffConfig) bool {
+	if len(conf.AllowList) > 0 && !slices.Contains(conf.AllowList, name) {
 		return false
 	}
-	for i, sec := range i.Sections {
-		if sec != x.Sections[i] {
-			return false
+	if len(conf.BlockList) > 0 && slices.Contains(conf.BlockList, name) {
+		return false
+	}
+	return true
+}
+
+// sectionHashMode says how — or whether — a section's content is digested.
+type sectionHashMode int
+
+const (
+	// hashSkip means section content is intentionally ignored. It is the zero
+	// value so missing classification metadata defaults to no content hash.
+	hashSkip sectionHashMode = iota
+	// hashVerbatim digests the raw bytes.
+	hashVerbatim
+	// hashCStringsOrdered digests normalized NUL-terminated strings in section
+	// order. Standalone and explicitly allowed section bytes are address-sensitive.
+	hashCStringsOrdered
+	// hashCStringsMultiset ignores literal-pool order in a default container
+	// comparison, where linker reshuffling is otherwise dominant noise.
+	hashCStringsMultiset
+)
+
+// stableSectionHashModes names the sections whose bytes still mean the same
+// thing after everything around them moves. Literal section TYPES are recognized
+// by flag in sectionContentHashMode, so only sections typed S_REGULAR belong here.
+//
+// Most non-code sections are deliberately absent. In a shared-cache or fileset
+// image, pointer slots are stored as cache-/collection-relative offsets, and the
+// __TEXT metadata sections (__unwind_info, __eh_frame, __objc_methlist, the
+// __swift5_* tables) store image-relative offsets. Every one of those bytes
+// changes when an unrelated image earlier in the container grows by a byte, so
+// hashing them reports "this container was rebuilt", not "this binary changed":
+// across two adjacent iOS betas it flagged 4515 of 4646 dylibs, which buried the
+// real diffs. Literal data has no such dependence, so that is all we hash.
+//
+// Expect this list to grow: Apple adds literal sections (particularly __swift*)
+// most releases. For container images without an explicit allow-list, a missing
+// entry fails quiet — the section simply stops being compared — so new literal
+// sections belong here as they appear.
+var stableSectionHashModes = map[string]sectionHashMode{
+	// Runs of NUL-terminated strings a producer may emit as S_REGULAR rather
+	// than S_CSTRING_LITERALS. __os_log is listed because go-macho's GetCStrings
+	// counts it, and the rendered CStrings list and the section hash have to
+	// agree about what a literal pool is.
+	"__TEXT.__objc_methname":  hashCStringsMultiset,
+	"__TEXT.__objc_classname": hashCStringsMultiset,
+	"__TEXT.__objc_methtype":  hashCStringsMultiset,
+	"__TEXT.__swift5_reflstr": hashCStringsMultiset,
+	"__TEXT.__os_log":         hashCStringsMultiset,
+
+	// __ustring is UTF-16, so splitting it on single NUL bytes would be wrong.
+	"__TEXT.__ustring":              hashVerbatim,
+	"__TEXT.__info_plist":           hashVerbatim,
+	"__TEXT.__entitlements":         hashVerbatim,
+	"__DATA_CONST.__objc_imageinfo": hashVerbatim,
+}
+
+// sectionContentHashMode reports how a section's content should be digested.
+// compareAllContent is true for standalone Mach-Os and for container images
+// whose caller supplied an explicit allow-list.
+func sectionContentHashMode(s *types.Section, compareAllContent bool) sectionHashMode {
+	if s == nil {
+		return hashSkip
+	}
+	flags := s.Flags
+	if sectionContainsCode(s) ||
+		flags.IsZerofill() || flags.IsGbZerofill() || flags.IsThreadLocalZerofill() {
+		return hashSkip
+	}
+	if flags.IsCstringLiterals() {
+		if compareAllContent {
+			return hashCStringsOrdered
 		}
+		return hashCStringsMultiset
+	}
+	if flags.Is4ByteLiterals() || flags.Is8ByteLiterals() || flags.Is16ByteLiterals() {
+		return hashVerbatim
+	}
+	if mode, ok := stableSectionHashModes[s.Seg+"."+s.Name]; ok {
+		if compareAllContent && mode == hashCStringsMultiset {
+			return hashCStringsOrdered
+		}
+		return mode
+	}
+	if compareAllContent {
+		// Standalone content is meaningful verbatim; an explicit container
+		// allow-list requests the same comparison for otherwise unclassified
+		// sections despite relocation noise.
+		return hashVerbatim
+	}
+	return hashSkip
+}
+
+func sectionContentHashWithMode(s *types.Section, mode sectionHashMode, ignoreBuildTimestamps bool) (string, bool) {
+	if s == nil || s.Size == 0 {
+		return "", false
+	}
+	switch mode {
+	case hashCStringsOrdered:
+		return normalizedCStringOrderedHash(s, ignoreBuildTimestamps)
+	case hashCStringsMultiset:
+		return normalizedCStringMultisetHash(s, ignoreBuildTimestamps)
+	case hashVerbatim:
+		// Stream the section through the hasher rather than slurping s.Data():
+		// DSC dylib sections can be multi-MB, and this runs for every included
+		// section of every binary on both sides.
+		return streamSHA256(s.Open())
+	default:
+		return "", false
+	}
+}
+
+// normalizedCStringBytes collapses rotating build-path tokens in one literal.
+// The '/' gate keeps the ~99% of strings that hold no path off the regex path
+// and avoids their []byte->string copy.
+func normalizedCStringBytes(value []byte, ignoreBuildTimestamps bool) []byte {
+	if ignoreBuildTimestamps && compilerBuildTimestampRE.Match(value) {
+		return []byte(compilerBuildTimestampPlaceholder)
+	}
+	if bytes.IndexByte(value, '/') < 0 {
+		return value
+	}
+	return []byte(normalizeBuildPathForDiff(string(value)))
+}
+
+// maxCStringToken bounds how far bufio.Scanner may grow its buffer for a single
+// string in a literal pool.
+const maxCStringToken = 1 << 20
+
+// splitCString is a bufio.SplitFunc yielding each NUL-terminated string in a
+// literal pool, plus any unterminated tail. Empty strings between adjacent NULs
+// are emitted too, so alignment padding counts toward the digest.
+func splitCString(data []byte, atEOF bool) (int, []byte, error) {
+	if i := bytes.IndexByte(data, 0); i >= 0 {
+		return i + 1, data[:i], nil
+	}
+	if atEOF && len(data) > 0 {
+		return len(data), data, nil
+	}
+	return 0, nil, nil
+}
+
+func newCStringScanner(s *types.Section, buf []byte) *bufio.Scanner {
+	sc := bufio.NewScanner(s.Open())
+	// Keep the token cap independent of the input-controlled section size. A
+	// malformed unterminated token then fails without driving an equally large
+	// allocation, and callers fall back to the bounded raw section hash.
+	limit := maxCStringToken
+	if s.Size < uint64(limit) {
+		limit = int(s.Size) + 1
+	}
+	sc.Buffer(buf, limit)
+	sc.Split(splitCString)
+	return sc
+}
+
+// normalizedCStringOrderedHash preserves the address order of normalized
+// literals. Length prefixes keep token boundaries unambiguous after build-path
+// normalization.
+func normalizedCStringOrderedHash(s *types.Section, ignoreBuildTimestamps bool) (string, bool) {
+	hs := hashStreamPool.Get().(*hashStream)
+	defer hashStreamPool.Put(hs)
+	hs.h.Reset()
+
+	sc := newCStringScanner(s, hs.buf)
+	var count uint64
+	var lane [8]byte
+	for sc.Scan() {
+		value := normalizedCStringBytes(sc.Bytes(), ignoreBuildTimestamps)
+		binary.LittleEndian.PutUint64(lane[:], uint64(len(value)))
+		_, _ = hs.h.Write(lane[:])
+		_, _ = hs.h.Write(value)
+		count++
+	}
+	if sc.Err() != nil {
+		return streamSHA256(s.Open())
+	}
+	if count == 0 {
+		return "", false
+	}
+
+	var sum [sha256.Size]byte
+	return hex.EncodeToString(hs.h.Sum(sum[:0])), true
+}
+
+// addCStringDigest adds a SHA-256 digest to a 256-bit wrapping accumulator.
+func addCStringDigest(acc *[4]uint64, digest [sha256.Size]byte) {
+	var carry uint64
+	for idx := range acc {
+		acc[idx], carry = bits.Add64(acc[idx], binary.LittleEndian.Uint64(digest[idx*8:(idx+1)*8]), carry)
+	}
+}
+
+// normalizedCStringMultisetHash digests a section's literal pool as a
+// MULTISET: every string is normalized, reduced to a SHA-256 digest, and added
+// to a 256-bit wrapping accumulator. Addition is commutative and still counts
+// duplicates (n copies contribute n*d). The string count is folded in as well
+// so multisets of different sizes cannot agree on the accumulator alone.
+//
+// Discarding order is deliberate only for a default container comparison, where
+// the linker may reshuffle a pool and rewrite its references as part of the same
+// rebuild. That reshuffling alone accounted for 106 of the 233 dylibs still
+// flagged after build-path normalization across two adjacent iOS betas.
+// Standalone and explicitly allowed sections use normalizedCStringOrderedHash.
+//
+// Addition rather than sorting the digests keeps memory bounded and avoids the
+// sorting cost while retaining a 256-bit accumulator of cryptographic digests.
+//
+// The section is streamed rather than slurped: __cstring runs to several MB in
+// the larger dylibs, and this runs for both sides of every binary.
+func normalizedCStringMultisetHash(s *types.Section, ignoreBuildTimestamps bool) (string, bool) {
+	hs := hashStreamPool.Get().(*hashStream)
+	defer hashStreamPool.Put(hs)
+
+	sc := newCStringScanner(s, hs.buf)
+	var acc [4]uint64
+	var count uint64
+	for sc.Scan() {
+		addCStringDigest(&acc, sha256.Sum256(normalizedCStringBytes(sc.Bytes(), ignoreBuildTimestamps)))
+		count++
+	}
+	if sc.Err() != nil {
+		return streamSHA256(s.Open())
+	}
+	if count == 0 {
+		return "", false
+	}
+
+	hs.h.Reset()
+	var lane [8]byte
+	for _, value := range acc {
+		binary.LittleEndian.PutUint64(lane[:], value)
+		_, _ = hs.h.Write(lane[:])
+	}
+	binary.LittleEndian.PutUint64(lane[:], count)
+	_, _ = hs.h.Write(lane[:])
+	var sum [sha256.Size]byte
+	return hex.EncodeToString(hs.h.Sum(sum[:0])), true
+}
+
+func sectionContainsCode(s *types.Section) bool {
+	if s == nil {
+		return false
+	}
+	flags := s.Flags
+	return flags.IsPureInstructions() ||
+		flags.IsSomeInstructions() ||
+		flags.IsSymbolStubs() ||
+		flags.IsSelfModifyingCode()
+}
+
+func appendFunctionSummary(out, functions *strings.Builder) {
+	if functions.Len() == 0 {
+		return
+	}
+	out.WriteString("Functions:\n")
+	out.WriteString(functions.String())
+}
+
+// sectionContentChanges reports the sections whose hash mode or content hash
+// changed while their size stayed the same. A size change already shows in the
+// diff'd section list, so those are skipped; this surfaces the same-size content
+// edits that dropping the per-section sha256 from DiffInfo.String would otherwise
+// hide, without re-introducing the sha256 wall.
+func sectionContentChanges(oldInfo, newInfo *DiffInfo) []string {
+	if len(oldInfo.Sections) == 0 || len(newInfo.Sections) == 0 {
+		return nil
+	}
+	newSections := make(map[string]section, len(newInfo.Sections))
+	for _, sec := range newInfo.Sections {
+		newSections[sec.Name] = sec
+	}
+	var changes []string
+	for _, oldSec := range oldInfo.Sections {
+		if newSec, ok := newSections[oldSec.Name]; ok && sameSizeContentChanged(oldSec, newSec) {
+			changes = append(changes, oldSec.Name)
+		}
+	}
+	return changes
+}
+
+// sameSizeContentChanged reports whether two same-named sections have different
+// section types, hash modes, or content hashes but the same size (a size change
+// already shows in the diff'd section list, so it is excluded here). A skipped
+// hash (code/zerofill sections, FairPlay-degraded info) stays a wildcard: it
+// means "content not compared", not "content changed".
+func sameSizeContentChanged(oldSec, newSec section) bool {
+	if oldSec.HashMode == hashSkip || newSec.HashMode == hashSkip {
+		return false
+	}
+	return oldSec.Size == newSec.Size &&
+		(oldSec.Type != newSec.Type || !equivalentSectionContent(oldSec, newSec))
+}
+
+// equivalentSectionContent compares both the selected hash policy and its
+// result. A missing required hash is a change; a skipped hash stays a wildcard.
+func equivalentSectionContent(a, b section) bool {
+	if a.HashMode != b.HashMode {
+		return false
+	}
+	if a.HashMode != hashSkip && (a.Hash == "") != (b.Hash == "") {
+		return false
+	}
+	return a.Hash == "" || b.Hash == "" || a.Hash == b.Hash
+}
+
+// containsAddedOrRemovedRows reports whether body has a real added or removed
+// row. Summary-only rows (including "~" modified rows) belong in a text fence.
+func containsAddedOrRemovedRows(body string) bool {
+	for line := range strings.SplitSeq(body, "\n") {
+		if strings.HasPrefix(line, "+") || strings.HasPrefix(line, "-") {
+			return true
+		}
+	}
+	return false
+}
+
+// Equivalent reports whether two DiffInfos have the same report-visible
+// semantics for conf. It deliberately ignores absolute function addresses,
+// which shift when unrelated layout changes move a function without changing
+// its size sequence.
+func (i DiffInfo) Equivalent(x DiffInfo, conf *DiffConfig) bool {
+	if conf == nil {
+		conf = &DiffConfig{}
+	}
+	if !equivalentStringSet(i.Imports, x.Imports) ||
+		!equivalentSections(i.Sections, x.Sections) ||
+		!equivalentNormalizedStrings(i.Symbols, x.Symbols, normalizeSymbolForDiff) {
+		return false
+	}
+	if conf.CStrings && !equivalentNormalizedStrings(i.CStrings, x.CStrings, cstringNormalizer(conf.IgnoreBuildTimestamps)) {
+		return false
 	}
 	if i.Functions != x.Functions {
 		return false
 	}
-	if len(i.Symbols) != len(x.Symbols) {
+	if conf.FuncStarts && !equivalentFunctions(i, x) {
 		return false
 	}
-	if i.Verbose && x.Verbose {
-		if i.Version != x.Version {
+	if !conf.IgnoreLoadCommands && i.LoadCmdHash != "" && x.LoadCmdHash != "" && i.LoadCmdHash != x.LoadCmdHash {
+		return false
+	}
+	if conf.Verbose && (i.Version != x.Version || i.UUID != x.UUID) {
+		return false
+	}
+	return true
+}
+
+func equivalentStringSet(a, b []string) bool {
+	if slices.Equal(a, b) {
+		return true
+	}
+	left := slices.Clone(a)
+	right := slices.Clone(b)
+	slices.Sort(left)
+	slices.Sort(right)
+	left = slices.Compact(left)
+	right = slices.Compact(right)
+	return slices.Equal(left, right)
+}
+
+func equivalentNormalizedStrings(a, b []string, normalize func(string) string) bool {
+	if slices.Equal(a, b) {
+		return true
+	}
+	left := normalizedStringSet(a, normalize)
+	right := normalizedStringSet(b, normalize)
+	return slices.Equal(left, right)
+}
+
+func normalizedStringSet(values []string, normalize func(string) string) []string {
+	normalized := make([]string, len(values))
+	for idx := range values {
+		normalized[idx] = normalize(values[idx])
+	}
+	slices.Sort(normalized)
+	return slices.Compact(normalized)
+}
+
+func equivalentSections(a, b []section) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for idx := range a {
+		if a[idx].Name != b[idx].Name || a[idx].Size != b[idx].Size || a[idx].Type != b[idx].Type ||
+			!equivalentSectionContent(a[idx], b[idx]) {
 			return false
 		}
-		if i.UUID != x.UUID {
+	}
+	return true
+}
+
+func equivalentFunctions(i, x DiffInfo) bool {
+	if len(i.Starts) != len(x.Starts) {
+		return false
+	}
+	for idx := range i.Starts {
+		if i.Starts[idx].EndAddr-i.Starts[idx].StartAddr != x.Starts[idx].EndAddr-x.Starts[idx].StartAddr {
 			return false
 		}
 	}
@@ -268,229 +1248,50 @@ func (i DiffInfo) Equal(x DiffInfo) bool {
 }
 
 func (i *DiffInfo) String() string {
+	return i.stringForDiff(nil)
+}
+
+func (i *DiffInfo) stringForDiff(conf *DiffConfig) string {
+	ignoreBuildTimestamps := conf != nil && conf.IgnoreBuildTimestamps
 	var out strings.Builder
-	out.WriteString(i.Version + "\n")
+	if i.Version != "" {
+		out.WriteString(i.Version + "\n")
+	}
 	for _, sec := range i.Sections {
 		out.WriteString(fmt.Sprintf("  %s: %#x\n", sec.Name, sec.Size))
 	}
 	slices.Sort(i.Imports)
-	for _, imp := range i.Imports {
-		out.WriteString(fmt.Sprintf("  - %s\n", imp))
+	for _, i := range i.Imports {
+		out.WriteString(fmt.Sprintf("  - %s\n", i))
 	}
-	out.WriteString(fmt.Sprintf("  UUID: %s\n", i.UUID))
+	if i.Verbose && i.UUID != "" {
+		out.WriteString(fmt.Sprintf("  UUID: %s\n", i.UUID))
+	}
 	out.WriteString(fmt.Sprintf("  Functions: %d\n", i.Functions))
-	out.WriteString(fmt.Sprintf("  Symbols:   %d\n", len(i.Symbols)))
-	out.WriteString(fmt.Sprintf("  CStrings:  %d\n", len(i.CStrings)))
+	out.WriteString(fmt.Sprintf("  Symbols:   %d\n", len(normalizedStringSet(i.Symbols, normalizeSymbolForDiff))))
+	out.WriteString(fmt.Sprintf("  CStrings:  %d\n", len(normalizedStringSet(i.CStrings, cstringNormalizer(ignoreBuildTimestamps)))))
 	return out.String()
-}
-
-// FormatUpdatedDiff renders a single-binary unified diff: header, symbols,
-// optional function-starts size deltas, optional cstring add/remove.
-func FormatUpdatedDiff(oldInfo, newInfo *DiffInfo, conf *DiffConfig) (string, error) {
-	if oldInfo == nil || newInfo == nil {
-		return "", fmt.Errorf("nil diff info")
-	}
-
-	out, err := vutils.GitDiff(oldInfo.String()+"\n", newInfo.String()+"\n", &vutils.GitDiffConfig{Color: conf.Color, Tool: conf.DiffTool})
-	if err != nil {
-		return "", err
-	}
-	if len(out) == 0 && len(oldInfo.Symbols) == len(newInfo.Symbols) && len(oldInfo.CStrings) == len(newInfo.CStrings) {
-		return "", nil
-	}
-
-	var b strings.Builder
-	if oldInfo.Encrypted || newInfo.Encrypted {
-		b.WriteString("> ⚠️ encrypted: structural diff only (sections/imports)\n\n")
-	}
-	if conf.Markdown {
-		b.WriteString("```diff\n")
-		b.WriteString(out)
-	} else {
-		b.WriteString(out)
-	}
-
-	// Symbols
-	newSyms := vutils.Difference(newInfo.Symbols, oldInfo.Symbols)
-	sort.Strings(newSyms)
-	rmSyms := vutils.Difference(oldInfo.Symbols, newInfo.Symbols)
-	sort.Strings(rmSyms)
-	if len(newSyms) > 0 || len(rmSyms) > 0 {
-		b.WriteString("Symbols:\n")
-		for _, s := range newSyms {
-			b.WriteString(fmt.Sprintf("+ %s\n", s))
-		}
-		for _, s := range rmSyms {
-			b.WriteString(fmt.Sprintf("- %s\n", s))
-		}
-	}
-
-	// Functions
-	if conf.FuncStarts {
-		printable := func(f types.Function, smap map[uint64]string) string {
-			if sym, ok := smap[f.StartAddr]; ok {
-				return sym
-			}
-			return fmt.Sprintf("sub_%x", f.StartAddr)
-		}
-
-		funcs1 := oldInfo.Starts
-		funcs2 := newInfo.Starts
-		n1, n2 := len(funcs1), len(funcs2)
-
-		var fb strings.Builder
-		appendLine := func(s string) {
-			if fb.Len() == 0 {
-				fb.WriteString("Functions:\n")
-			}
-			fb.WriteString(s)
-		}
-
-		if n1 == n2 {
-			consecutiveMismatch := 0
-			const maxMismatch = 5
-
-			for i := range n1 {
-				f1 := funcs1[i]
-				f2 := funcs2[i]
-				f1.Name = printable(f1, oldInfo.SymbolMap)
-				f2.Name = printable(f2, newInfo.SymbolMap)
-
-				if f1.Name != "" && f1.Name == f2.Name {
-					sz1 := f1.EndAddr - f1.StartAddr
-					sz2 := f2.EndAddr - f2.StartAddr
-					if sz1 != sz2 {
-						appendLine(fmt.Sprintf("~ %s : %d -> %d\n", f1.Name, sz1, sz2))
-					}
-					consecutiveMismatch = 0
-					continue
-				}
-
-				sz1 := f1.EndAddr - f1.StartAddr
-				sz2 := f2.EndAddr - f2.StartAddr
-
-				if sz1 == sz2 {
-					consecutiveMismatch = 0
-					continue
-				}
-
-				appendLine(fmt.Sprintf("~ %s -> %s : %d -> %d\n", f1.Name, f2.Name, sz1, sz2))
-				consecutiveMismatch++
-
-				if consecutiveMismatch >= maxMismatch {
-					recovered := false
-					const seekAhead = 6
-					if i+seekAhead < n1 {
-						matches := 0
-						for k := 1; k <= seekAhead && i+k < n1; k++ {
-							if (funcs1[i+k].EndAddr - funcs1[i+k].StartAddr) == (funcs2[i+k].EndAddr - funcs2[i+k].StartAddr) {
-								matches++
-								if matches >= 3 {
-									recovered = true
-									break
-								}
-							} else {
-								matches = 0
-							}
-						}
-					}
-					if !recovered {
-						fb.Reset()
-						break
-					}
-				}
-			}
-
-			if fb.Len() > 0 {
-				b.WriteString(fb.String())
-			}
-		} else {
-			i, j := 0, 0
-			consecutiveNoise := 0
-			const noiseLimit = 6
-
-			for i < n1 && j < n2 {
-				f1 := funcs1[i]
-				f2 := funcs2[j]
-				f1.Name = printable(f1, oldInfo.SymbolMap)
-				f2.Name = printable(f2, newInfo.SymbolMap)
-				if f1.Name != "" && f1.Name == f2.Name {
-					sz1 := f1.EndAddr - f1.StartAddr
-					sz2 := f2.EndAddr - f2.StartAddr
-					if sz1 != sz2 {
-						appendLine(fmt.Sprintf("~ %s : %d -> %d\n", f1.Name, sz1, sz2))
-					}
-					i++
-					j++
-					consecutiveNoise = 0
-					continue
-				}
-
-				if (f1.EndAddr - f1.StartAddr) == (f2.EndAddr - f2.StartAddr) {
-					i++
-					j++
-					consecutiveNoise = 0
-					continue
-				}
-
-				if j+1 < n2 && (f1.EndAddr-f1.StartAddr) == (funcs2[j+1].EndAddr-funcs2[j+1].StartAddr) {
-					appendLine(fmt.Sprintf("+ %s\n", f2.Name))
-					j++
-					consecutiveNoise++
-				} else if i+1 < n1 && (funcs1[i+1].EndAddr-funcs1[i+1].StartAddr) == (f2.EndAddr-f2.StartAddr) {
-					appendLine(fmt.Sprintf("- %s\n", f1.Name))
-					i++
-					consecutiveNoise++
-				} else {
-					consecutiveNoise++
-				}
-
-				if consecutiveNoise >= noiseLimit {
-					fb.Reset()
-					break
-				}
-			}
-
-			if fb.Len() > 0 {
-				b.WriteString(fb.String())
-			}
-		}
-	}
-
-	// CStrings
-	if conf.CStrings {
-		newStrs, rmStrs := diffNormalizedCStrings(oldInfo.CStrings, newInfo.CStrings)
-		if len(newStrs) > 0 || len(rmStrs) > 0 {
-			b.WriteString("CStrings:\n")
-			for _, s := range newStrs {
-				b.WriteString(fmt.Sprintf("+ %#v\n", s))
-			}
-			for _, s := range rmStrs {
-				b.WriteString(fmt.Sprintf("- %#v\n", s))
-			}
-		}
-	}
-
-	if conf.Markdown {
-		b.WriteString("\n```\n")
-	}
-
-	return b.String(), nil
 }
 
 // Generate computes New/Removed/Updated across two parallel
 // path->DiffInfo maps. The caller owns extraction; this function only
 // performs the set diff and per-pair formatting.
 func (diff *MachoDiff) Generate(prev, next map[string]*DiffInfo, conf *DiffConfig) error {
+	if diff.Updated == nil {
+		diff.Updated = make(map[string]string)
+	}
+
 	diff.New = vutils.Difference(slices.Collect(maps.Keys(next)), slices.Collect(maps.Keys(prev)))
 	diff.Removed = vutils.Difference(slices.Collect(maps.Keys(prev)), slices.Collect(maps.Keys(next)))
-	sort.Strings(diff.New)
-	sort.Strings(diff.Removed)
+	// Keys come from map iteration (random order); sort so the rendered diff is
+	// deterministic and matches the low-memory path (which already sorts).
+	slices.Sort(diff.New)
+	slices.Sort(diff.Removed)
 
 	for _, currentFileKey := range slices.Sorted(maps.Keys(next)) {
 		dat2 := next[currentFileKey]
 		if dat1, ok := prev[currentFileKey]; ok {
-			if dat2.Equal(*dat1) && !(dat1.Encrypted || dat2.Encrypted) {
+			if dat2.Equivalent(*dat1, conf) {
 				continue
 			}
 			formatted, err := FormatUpdatedDiff(dat1, dat2, conf)

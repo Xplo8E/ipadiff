@@ -28,6 +28,7 @@ func main() {
 		noSwift       bool
 		skipResources bool
 		keepBuildKeys bool
+		noTimestamps  bool
 		allowList     []string
 		blockList     []string
 		workers       int
@@ -59,18 +60,19 @@ func main() {
 			}
 
 			cfg := &ipadiff.Config{
-				Title:         title,
-				OldIPA:        oldIPA,
-				NewIPA:        newIPA,
-				Output:        output,
-				NoObjC:        noObjC,
-				NoSwift:       noSwift,
-				SkipResources: skipResources,
-				KeepBuildKeys: keepBuildKeys,
-				AllowList:     allowList,
-				BlockList:     blockList,
-				Workers:       workers,
-				Verbose:       verbose,
+				Title:                 title,
+				OldIPA:                oldIPA,
+				NewIPA:                newIPA,
+				Output:                output,
+				NoObjC:                noObjC,
+				NoSwift:               noSwift,
+				SkipResources:         skipResources,
+				KeepBuildKeys:         keepBuildKeys,
+				IgnoreBuildTimestamps: noTimestamps,
+				AllowList:             allowList,
+				BlockList:             blockList,
+				Workers:               workers,
+				Verbose:               verbose,
 			}
 			cfg.Defaults()
 			// Apply negative overrides after Defaults so disabling works.
@@ -117,6 +119,7 @@ func main() {
 	f.BoolVar(&noSwift, "no-swift", false, "Skip Swift metadata diff")
 	f.BoolVar(&skipResources, "skip-resources", false, "Skip text-resource diffs")
 	f.BoolVar(&keepBuildKeys, "keep-build-keys", false, "Keep Xcode/toolchain build-metadata keys (DTXcode, DTSDKBuild, ...) in plist diffs (default: suppressed)")
+	f.BoolVar(&noTimestamps, "ignore-build-timestamps", false, "Collapse __DATE__/__TIME__/__TIMESTAMP__ cstrings to a placeholder (default: report them)")
 	f.StringSliceVar(&allowList, "allow-list", nil, "Mach-O sections to include (e.g. __TEXT.__text)")
 	f.StringSliceVar(&blockList, "block-list", nil, "Mach-O sections to exclude")
 	f.IntVar(&workers, "workers", 0, "Parallel workers for per-binary and per-file diff phases (default: GOMAXPROCS)")

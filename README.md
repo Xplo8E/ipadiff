@@ -1,5 +1,7 @@
 # ipadiff
 
+[![Buy me a coffee](https://img.shields.io/badge/Buy%20me%20a%20coffee-Support%20my%20work-yellow?logo=buymeacoffee)](https://buymeacoffee.com/xplo8e)
+
 Structural diffing for two iOS `.ipa` files.
 
 `ipadiff` extracts both app bundles, compares the parts that matter, and writes a Markdown report. It is built for iOS reverse engineering, release review, and mobile security diffing.

@@ -90,9 +90,12 @@ func TestRenderReadme_StatsStayNeutral(t *testing.T) {
 	d.ObjC = map[string]string{}
 	d.Swift = map[string]string{}
 
-	out := renderReadme(d, &readmeLinks{
-		hasFrameworks: true,
-	})
+	out, err := renderReadme(d, &readmeLinks{
+		binaryFiles: map[string]string{framework: "FRAMEWORKS/Foo.md"},
+	}, "")
+	if err != nil {
+		t.Fatal(err)
+	}
 
 	if strings.Contains(out, "Binary intel") {
 		t.Fatalf("README still contains binary intel rollup:\n%s", out)
@@ -100,8 +103,11 @@ func TestRenderReadme_StatsStayNeutral(t *testing.T) {
 	if strings.Contains(out, "Top binaries") {
 		t.Fatalf("README still contains top-binary rollup:\n%s", out)
 	}
-	if !strings.Contains(out, "- **Mach-Os** — 0 new, 0 removed, 1 updated → [FRAMEWORKS/](./FRAMEWORKS/)") {
-		t.Fatalf("README missing neutral Mach-O stats:\n%s", out)
+	if !strings.Contains(out, "## Frameworks\n\n#### ⬆️ Updated (1)\n\n- [Frameworks/Foo.framework/Foo](FRAMEWORKS/Foo.md)") {
+		t.Fatalf("README missing neutral Mach-O triple:\n%s", out)
+	}
+	if !strings.Contains(out, "## EOF") {
+		t.Fatalf("README missing EOF terminator:\n%s", out)
 	}
 }
 
@@ -113,11 +119,14 @@ func TestRenderReadme_RendersWarnings(t *testing.T) {
 		Message: "parse failed",
 	}}
 
-	out := renderReadme(d, nil)
+	out, err := renderReadme(d, nil, "")
+	if err != nil {
+		t.Fatal(err)
+	}
 	if !strings.Contains(out, "## Warnings") {
 		t.Fatalf("README missing warnings section:\n%s", out)
 	}
-	if !strings.Contains(out, "`plists/Broken.plist` — parse failed") {
+	if !strings.Contains(out, "`plists/Broken.plist — parse failed`") {
 		t.Fatalf("README missing warning detail:\n%s", out)
 	}
 }
@@ -146,23 +155,35 @@ func TestWriteMarkdown_IgnoresConfiguredOutput(t *testing.T) {
 	}
 }
 
-func TestCollectPlists_AddsParseWarning(t *testing.T) {
+func TestCollectPlists_TextFallbackAndBinaryWarning(t *testing.T) {
 	dir := t.TempDir()
-	if err := os.WriteFile(filepath.Join(dir, "Broken.plist"), []byte("not a plist"), 0o644); err != nil {
+	// Text-like invalid plist: falls back to raw bytes, no warning, no drop.
+	if err := os.WriteFile(filepath.Join(dir, "OpenStep.strings"), []byte(`definitely "not" a @@@ parseable plist`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	// Binary look-alike (NUL early): dropped with a parse warning.
+	if err := os.WriteFile(filepath.Join(dir, "Broken.plist"), []byte("not\x00a\x00plist"), 0o644); err != nil {
 		t.Fatal(err)
 	}
 	d := &Diff{cfg: &Config{Workers: 4}}
-	got := d.collectPlists("old", &bundle.Bundle{
+	got, _, raw := d.collectPlists("old", &bundle.Bundle{
 		AppDir: dir,
 		Files: map[string]bundle.FileMeta{
-			"Broken.plist": {Kind: bundle.KindPlist},
+			"OpenStep.strings": {Kind: bundle.KindPlist},
+			"Broken.plist":     {Kind: bundle.KindPlist},
 		},
 	})
-	if len(got) != 0 {
-		t.Fatalf("collectPlists returned parsed data for invalid plist: %#v", got)
+	if got["OpenStep.strings"] != `definitely "not" a @@@ parseable plist` {
+		t.Fatalf("text-like invalid plist must fall back to raw bytes, got %#v", got["OpenStep.strings"])
+	}
+	if len(raw) != 1 || raw[0] != "OpenStep.strings" {
+		t.Fatalf("raw fallback list = %#v, want [OpenStep.strings]", raw)
+	}
+	if _, ok := got["Broken.plist"]; ok {
+		t.Fatalf("binary look-alike must be dropped, got %#v", got["Broken.plist"])
 	}
 	if len(d.Warnings) != 1 {
-		t.Fatalf("warnings = %#v, want one parse warning", d.Warnings)
+		t.Fatalf("warnings = %#v, want one parse warning for the binary file", d.Warnings)
 	}
 	if d.Warnings[0].Section != "plists" || d.Warnings[0].Path != "Broken.plist" {
 		t.Fatalf("unexpected warning: %#v", d.Warnings[0])
@@ -448,6 +469,12 @@ echo "# Hermes" > "$out/README.md"
 	d.Hermes = &HermesDiff{Updated: map[string]*HermesBundleDiff{
 		"main.jsbundle": {Path: "main.jsbundle"},
 	}}
+	// Production snapshots the bundles during diffHermes; simulate that so
+	// the sidecar reads private snapshot paths instead of the (already
+	// torn-down) IPA temp dirs.
+	if err := d.Hermes.Updated["main.jsbundle"].snapshotInputs(oldDir, newDir); err != nil {
+		t.Fatal(err)
+	}
 
 	out := t.TempDir()
 	if err := d.WriteFiles(out); err != nil {
@@ -458,8 +485,8 @@ echo "# Hermes" > "$out/README.md"
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !strings.Contains(string(readme), "[HERMES/](./HERMES/)") {
-		t.Fatalf("README missing HERMES link:\n%s", string(readme))
+	if !strings.Contains(string(readme), "[main.jsbundle](HERMES/main_jsbundle/README.md)") {
+		t.Fatalf("README missing per-bundle HERMES link:\n%s", string(readme))
 	}
 	if _, err := os.Stat(filepath.Join(root, "HERMES", "main_jsbundle", "manifest.json")); err != nil {
 		t.Fatalf("missing Hermes manifest: %v", err)
@@ -590,6 +617,12 @@ func TestWriteFiles_HermesSidecarTimeout(t *testing.T) {
 	d.Hermes = &HermesDiff{Updated: map[string]*HermesBundleDiff{
 		"main.jsbundle": {Path: "main.jsbundle"},
 	}}
+	// Production snapshots the bundles during diffHermes; simulate that so
+	// the sidecar reads private snapshot paths instead of the (already
+	// torn-down) IPA temp dirs.
+	if err := d.Hermes.Updated["main.jsbundle"].snapshotInputs(oldDir, newDir); err != nil {
+		t.Fatal(err)
+	}
 
 	if err := d.WriteFiles(t.TempDir()); err != nil {
 		t.Fatal(err)
@@ -620,11 +653,11 @@ func TestWriteFiles_SpillsLargeResources(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !strings.Contains(string(readme), "[RESOURCES/](./RESOURCES/)") {
-		t.Fatalf("README missing RESOURCES link:\n%s", string(readme))
+	if !strings.Contains(string(readme), "[Resources/file-00.json](RESOURCES/Resources_file-00.json.md)") {
+		t.Fatalf("README missing per-page resource links:\n%s", string(readme))
 	}
-	if strings.Contains(string(readme), "Resources/file-00.json") {
-		t.Fatalf("README kept spilled resource details inline:\n%s", string(readme))
+	if strings.Contains(string(readme), "-old\n+new") {
+		t.Fatalf("README kept spilled resource diffs inline:\n%s", string(readme))
 	}
 	if _, err := os.Stat(filepath.Join(root, "RESOURCES", "README.md")); err != nil {
 		t.Fatalf("missing resources index: %v", err)
@@ -720,5 +753,113 @@ func TestRenderBinaryFile_MetadataAndRawOnly(t *testing.T) {
 		if strings.Contains(out, unwanted) {
 			t.Fatalf("binary report still contains %q:\n%s", unwanted, out)
 		}
+	}
+}
+
+func TestDedupeBinaryPages_MergesIdenticalBodies(t *testing.T) {
+	shared := "# Frameworks/Foo.framework/Foo\n\n## Mach-O Metadata\n\nsame\n"
+	pages := []binaryPage{
+		{rel: "Frameworks/Foo.framework/Foo", fname: "FRAMEWORKS/Foo.md", body: shared},
+		{rel: "PlugIns/Ext.appex/Ext", fname: "PLUGINS/Ext.md", body: shared},
+		{rel: "PlugIns/Ext.appex/Frameworks/Foo.framework/Foo", fname: "PLUGINS/Foo2.md", body: shared},
+		{rel: "Demo", fname: "app.md", body: "# Demo\n\n## Mach-O Metadata\n\ndifferent\n"},
+	}
+	out := dedupeBinaryPages(pages)
+	if len(out) != len(pages) {
+		t.Fatalf("every page must still exist (README links rely on it), got %d of %d", len(out), len(pages))
+	}
+	heads, stubs := 0, 0
+	for _, p := range out {
+		switch {
+		case strings.Contains(p.body, "Same diff in:"):
+			heads++
+			if !strings.Contains(p.body, "PlugIns/Ext.appex/Ext") || !strings.Contains(p.body, "PlugIns/Ext.appex/Frameworks/Foo.framework/Foo") {
+				t.Fatalf("head note missing the duplicate rels: %s", p.body)
+			}
+		case strings.Contains(p.body, "Same diff as"):
+			stubs++
+		}
+	}
+	if heads != 1 || stubs != 2 {
+		t.Fatalf("want 1 head + 2 stubs, got %d heads + %d stubs", heads, stubs)
+	}
+	for _, p := range out {
+		if p.rel == "PlugIns/Ext.appex/Ext" && !strings.Contains(p.body, "../FRAMEWORKS/Foo.md") {
+			t.Fatalf("stub link must resolve relative to the stub's own dir: %s", p.body)
+		}
+	}
+}
+
+func TestDedupeBinaryPages_NoDuplicatesPassesThrough(t *testing.T) {
+	pages := []binaryPage{
+		{rel: "a", fname: "app.md", body: "# a\n\none\n"},
+		{rel: "b", fname: "FRAMEWORKS/b.md", body: "# b\n\ntwo\n"},
+	}
+	out := dedupeBinaryPages(pages)
+	if len(out) != 2 || out[0].fname != "app.md" || strings.Contains(out[0].body, "Same diff") {
+		t.Fatalf("unique pages must pass through unchanged, got %#v", out)
+	}
+}
+
+func TestRenderMachoGroupSections_PluginsExcludeFrameworks(t *testing.T) {
+	framework := "Frameworks/Foo.framework/Foo"
+	plugin := "PlugIns/Bar.appex/Bar"
+
+	d := testDiff()
+	d.Old.ExeName = "App"
+	d.New.ExeName = "App"
+	d.Machos = &vmacho.MachoDiff{
+		New:     []string{framework},
+		Removed: []string{plugin},
+		Updated: map[string]string{
+			framework: "fw diff",
+			plugin:    "plugin diff",
+		},
+	}
+	d.ObjC = map[string]string{}
+	d.Swift = map[string]string{}
+
+	var b strings.Builder
+	if err := renderMachoGroupSections(&b, d, &readmeLinks{binaryFiles: map[string]string{
+		framework: "FRAMEWORKS/Foo.md",
+		plugin:    "PLUGINS/Bar.md",
+	}}, ""); err != nil {
+		t.Fatal(err)
+	}
+	out := b.String()
+
+	// Frameworks heading holds only the framework; Plugins only the plugin.
+	if !strings.Contains(out, "## Frameworks\n\n#### 🆕 NEW (1)") ||
+		!strings.Contains(out, "- `"+framework+"`") {
+		t.Fatalf("frameworks section missing the framework:\n%s", out)
+	}
+	if strings.Contains(out, "## Plugins\n\n#### 🆕 NEW") {
+		t.Fatalf("plugins section must not list framework additions:\n%s", out)
+	}
+	pluginsIdx := strings.Index(out, "## Plugins")
+	pluginsPart := out[pluginsIdx:]
+	if !strings.Contains(pluginsPart, plugin) || strings.Contains(pluginsPart, framework) {
+		t.Fatalf("plugins section must list only plugins:\n%s", pluginsPart)
+	}
+}
+
+func TestRenderReadme_StreamedInlinesBinaryDiffs(t *testing.T) {
+	main := "App"
+	d := testDiff()
+	d.Old.ExeName = main
+	d.New.ExeName = main
+	d.Machos = &vmacho.MachoDiff{Updated: map[string]string{main: "```diff\n- old\n+ new\n```"}}
+	d.ObjC = map[string]string{main: "+ someClass"}
+	d.Swift = map[string]string{}
+
+	out, err := renderReadme(d, nil, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(out, "<details>\n<summary><code>App</code></summary>") {
+		t.Fatalf("streamed README must inline the binary diff body:\n%s", out)
+	}
+	if !strings.Contains(out, "- old\n+ new") || !strings.Contains(out, "+ someClass") {
+		t.Fatalf("streamed README lost the diff bodies:\n%s", out)
 	}
 }

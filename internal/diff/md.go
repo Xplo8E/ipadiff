@@ -1,11 +1,13 @@
 package diff
 
 import (
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
 	"os"
 	"path/filepath"
+	"slices"
 	"sort"
 	"strings"
 	"unicode"
@@ -37,7 +39,11 @@ func (d *Diff) Markdown(w io.Writer) error {
 // WriteMarkdown streams a single-file Markdown report to w, regardless of
 // Config.Output. Use WriteFiles for the multi-file layout.
 func (d *Diff) WriteMarkdown(w io.Writer) error {
-	_, err := io.WriteString(w, renderReadme(d, nil))
+	out, err := renderReadme(d, nil, "")
+	if err != nil {
+		return err
+	}
+	_, err = io.WriteString(w, out)
 	return err
 }
 
@@ -286,25 +292,31 @@ func (d *Diff) writeMultiFile(output string) error {
 	}
 
 	used := map[string]bool{}
-	links := readmeLinks{binaryFiles: map[string]string{}}
+	links := readmeLinks{
+		binaryFiles:   map[string]string{},
+		plistFiles:    map[string]string{},
+		resourceFiles: map[string]string{},
+	}
 
 	// Track whether at least one binary in each non-main bucket exists,
 	// so renderStats can decide whether to surface the dir-link.
 	hasFrameworkDir := false
 	hasPluginDir := false
 
+	// Render every binary page first, then deduplicate: the same framework
+	// binary copied into the main app and every appex otherwise renders the
+	// identical comparison once per copy. The first page in order stays full
+	// with a "Same diff in" note; the others become stubs pointing at it, so
+	// every README link still resolves.
+	var pages []binaryPage
 	for _, rel := range d.allBinaryRelPaths() {
 		body := renderBinaryFile(rel, d)
 		kind := classifyBinary(rel, mainExe)
-
+		var fname string
 		switch kind {
 		case binMain:
-			fname := uniqueName(used, d.MainFileName()+".md")
-			if err := os.WriteFile(filepath.Join(root, fname), []byte(body), 0o644); err != nil {
-				return err
-			}
+			fname = uniqueName(used, d.MainFileName()+".md")
 			links.main = fname
-			links.binaryFiles[rel] = fname
 		case binFramework:
 			if !hasFrameworkDir {
 				if err := os.MkdirAll(filepath.Join(root, "FRAMEWORKS"), 0o755); err != nil {
@@ -312,12 +324,7 @@ func (d *Diff) writeMultiFile(output string) error {
 				}
 				hasFrameworkDir = true
 			}
-			rel2 := "FRAMEWORKS" + string(filepath.Separator) + niceBinaryFileName(rel)
-			rel2 = uniqueName(used, rel2)
-			if err := os.WriteFile(filepath.Join(root, rel2), []byte(body), 0o644); err != nil {
-				return err
-			}
-			links.binaryFiles[rel] = rel2
+			fname = uniqueName(used, "FRAMEWORKS"+string(filepath.Separator)+niceBinaryFileName(rel))
 		case binPlugin:
 			if !hasPluginDir {
 				if err := os.MkdirAll(filepath.Join(root, "PLUGINS"), 0o755); err != nil {
@@ -325,18 +332,20 @@ func (d *Diff) writeMultiFile(output string) error {
 				}
 				hasPluginDir = true
 			}
-			rel2 := "PLUGINS" + string(filepath.Separator) + niceBinaryFileName(rel)
-			rel2 = uniqueName(used, rel2)
-			if err := os.WriteFile(filepath.Join(root, rel2), []byte(body), 0o644); err != nil {
-				return err
-			}
-			links.binaryFiles[rel] = rel2
+			fname = uniqueName(used, "PLUGINS"+string(filepath.Separator)+niceBinaryFileName(rel))
+		}
+		links.binaryFiles[rel] = fname
+		pages = append(pages, binaryPage{rel: rel, fname: fname, body: body})
+	}
+	for _, p := range dedupeBinaryPages(pages) {
+		if err := os.WriteFile(filepath.Join(root, p.fname), []byte(p.body), 0o644); err != nil {
+			return err
 		}
 	}
 	links.hasFrameworks = hasFrameworkDir
 	links.hasPlugins = hasPluginDir
 
-	// Per-plist files — README links to the folder only, no per-file index.
+	// Per-plist diff pages; the README links each page individually.
 	if d.Plists != nil && len(d.Plists.Updated) > 0 {
 		pages := buildPlistPages(d.Plists)
 		if len(pages) > 0 {
@@ -348,12 +357,15 @@ func (d *Diff) writeMultiFile(output string) error {
 				if err := os.WriteFile(filepath.Join(root, rel2), []byte(page.body), 0o644); err != nil {
 					return err
 				}
+				links.plistFiles[page.displayPath] = rel2
 			}
 			links.hasPlists = true
 		}
 	}
 
-	if shouldSpillResources(d.Resources) {
+	// Resource diff pages: every updated text resource gets its own page so
+	// the README stays a pure index.
+	if d.Resources != nil && len(d.Resources.Updated) > 0 {
 		if err := os.MkdirAll(filepath.Join(root, "RESOURCES"), 0o755); err != nil {
 			return err
 		}
@@ -363,8 +375,19 @@ func (d *Diff) writeMultiFile(output string) error {
 			if err := os.WriteFile(filepath.Join(root, rel2), []byte(page.body), 0o644); err != nil {
 				return err
 			}
+			if page.displayPath != "" {
+				links.resourceFiles[page.displayPath] = rel2
+			}
 		}
 		links.hasResources = true
+	}
+
+	// Entitlements side-car: the README links it instead of inlining the diff.
+	if entCount := countEntChanges(d.Ents); entCount > 0 {
+		body := fmt.Sprintf("# Entitlements\n\n%d changed binaries.\n\n%s\n", entCount, d.Ents)
+		if err := os.WriteFile(filepath.Join(root, "Entitlements.md"), []byte(body), 0o644); err != nil {
+			return err
+		}
 	}
 
 	if ok, err := d.writeHermesFiles(root); err != nil {
@@ -373,11 +396,62 @@ func (d *Diff) writeMultiFile(output string) error {
 		links.hasHermes = true
 	}
 
+	if d.cfg.Facts {
+		if err := d.writeFacts(root); err != nil {
+			return fmt.Errorf("write facts: %w", err)
+		}
+	}
+
+	out, err := renderReadme(d, &links, root)
+	if err != nil {
+		return err
+	}
 	return os.WriteFile(
 		filepath.Join(root, "README.md"),
-		[]byte(renderReadme(d, &links)),
+		[]byte(out),
 		0o644,
 	)
+}
+
+// writeFacts emits machine-readable per-binary comparison facts for both
+// sides, keyed by bundle-relative path. Each binary's facts carry the policy
+// that produced them, section content hashes, the load-command digest, and
+// the code signature's entitlements + launch constraints, so scripted
+// consumers can diff the JSON without re-parsing Mach-Os. The per-function
+// start/end arrays are dropped unless cfg.FactsFunctionStarts is set: they
+// dominate the file size (hundreds of thousands of entries per binary) while
+// the section content hashes and load-command digest already carry the
+// change signal.
+func (d *Diff) writeFacts(root string) error {
+	if len(d.factsOld) == 0 && len(d.factsNew) == 0 {
+		return nil
+	}
+	if !d.cfg.FactsFunctionStarts {
+		stripFunctionStarts(d.factsOld)
+		stripFunctionStarts(d.factsNew)
+	}
+	type factsFile struct {
+		Schema string                             `json:"schema"`
+		Old    map[string]*vmacho.ComparisonFacts `json:"old,omitempty"`
+		New    map[string]*vmacho.ComparisonFacts `json:"new,omitempty"`
+	}
+	data, err := json.MarshalIndent(factsFile{
+		Schema: "ipadiff-facts-v1",
+		Old:    d.factsOld,
+		New:    d.factsNew,
+	}, "", "  ")
+	if err != nil {
+		return err
+	}
+	return os.WriteFile(filepath.Join(root, "facts.json"), append(data, '\n'), 0o644)
+}
+
+func stripFunctionStarts(facts map[string]*vmacho.ComparisonFacts) {
+	for _, f := range facts {
+		if f != nil {
+			f.FunctionStarts = nil
+		}
+	}
 }
 
 func (d *Diff) safeOutputRoot(output string) (string, error) {
@@ -421,21 +495,487 @@ type readmeLinks struct {
 	hasResources  bool
 	hasHermes     bool
 	binaryFiles   map[string]string
+	// plistFiles / resourceFiles map a page's display path to the written
+	// file name, so the README can link every diff page individually.
+	plistFiles    map[string]string
+	resourceFiles map[string]string
 }
 
-func renderReadme(d *Diff, links *readmeLinks) string {
+// ----- uniform list rule ----------------------------------------------------
+//
+// Every counted list in the README renders under one three-state rule,
+// mirroring the latest ipsw diff renderer: fewer than listCollapseThreshold
+// entries render as plain bullets, up to listSpillThreshold entries collapse
+// into a <details> block, and anything at or above listSpillThreshold spills
+// to a side-car doc with a single "View N" link (file mode only — the
+// streamed report collapses instead of writing files).
+
+const (
+	listCollapseThreshold = 30
+	listSpillThreshold    = 1000
+)
+
+// listLine is one README bullet: plain text (href "") or a markdown link.
+// href is always relative to the report root (page file names already carry
+// their section directory), so it is used verbatim.
+type listLine struct {
+	text string
+	href string
+}
+
+func (l listLine) markdown() string {
+	if l.href == "" {
+		return "- `" + l.text + "`\n"
+	}
+	return fmt.Sprintf("- [%s](%s)\n", l.text, l.href)
+}
+
+// renderCountedList renders one counted heading plus its bullets under the
+// three-state rule. spillSubDir/spillLabel control the side-car doc for the
+// spill case; an empty root (streamed report) skips spilling and collapses.
+func renderCountedList(out *strings.Builder, headingPrefix, title string, lines []listLine, root, spillSubDir, spillLabel string) error {
+	if len(lines) == 0 {
+		return nil
+	}
+	fmt.Fprintf(out, "%s %s (%d)\n\n", headingPrefix, title, len(lines))
+	switch {
+	case len(lines) >= listSpillThreshold && root != "" && spillSubDir != "":
+		var body strings.Builder
+		fmt.Fprintf(&body, "## %s (%d)\n\n", title, len(lines))
+		for _, l := range lines {
+			body.WriteString(l.markdown())
+		}
+		relName, err := writeSpillDoc(root, spillSubDir, spillLabel, body.String())
+		if err != nil {
+			return err
+		}
+		fmt.Fprintf(out, "- [View %d entries](%s)\n\n", len(lines), filepath.Join(spillSubDir, relName))
+	case len(lines) >= listCollapseThreshold:
+		fmt.Fprintf(out, "<details>\n  <summary><i>View %s</i></summary>\n\n", strings.TrimSpace(title))
+		for _, l := range lines {
+			out.WriteString(l.markdown())
+		}
+		out.WriteString("\n</details>\n\n")
+	default:
+		for _, l := range lines {
+			out.WriteString(l.markdown())
+		}
+		out.WriteString("\n")
+	}
+	return nil
+}
+
+// renderDiffTriple renders the 🆕 NEW / ❌ Removed / ⬆️ Updated triple for one
+// binary group or section.
+func renderDiffTriple(out *strings.Builder, headingPrefix string, newLines, removedLines, updatedLines []listLine, root, spillSubDir, label string) error {
+	if err := renderCountedList(out, headingPrefix, "🆕 NEW", newLines, root, spillSubDir, label+".New"); err != nil {
+		return err
+	}
+	if err := renderCountedList(out, headingPrefix, "❌ Removed", removedLines, root, spillSubDir, label+".Removed"); err != nil {
+		return err
+	}
+	return renderCountedList(out, headingPrefix, "⬆️ Updated", updatedLines, root, spillSubDir, label+".Updated")
+}
+
+// writeSpillDoc writes body to <root>/<subDir>/<label>.md (sanitized) and
+// returns the base name for the README link.
+func writeSpillDoc(root, subDir, label, body string) (string, error) {
+	relName := safeName(label) + ".md"
+	fname := filepath.Join(root, subDir, relName)
+	if err := os.MkdirAll(filepath.Dir(fname), 0o755); err != nil {
+		return "", err
+	}
+	if err := os.WriteFile(fname, []byte(body), 0o644); err != nil {
+		return "", err
+	}
+	return relName, nil
+}
+
+// nameLines converts sorted rel paths to plain bullets.
+func nameLines(paths []string) []listLine {
+	lines := make([]listLine, 0, len(paths))
+	for _, p := range paths {
+		lines = append(lines, listLine{text: p})
+	}
+	return lines
+}
+
+// linkLines converts path->file-name maps to sorted link bullets.
+func linkLines(m map[string]string) []listLine {
+	keys := mapKeys(m)
+	sort.Strings(keys)
+	lines := make([]listLine, 0, len(keys))
+	for _, k := range keys {
+		lines = append(lines, listLine{text: k, href: m[k]})
+	}
+	return lines
+}
+
+// renderReadme composes the index README. In file mode (links non-nil, root
+// set) it is a pure index: every diff lives in its own page or side-car doc
+// and the README shows counted, emoji-tagged links under the uniform
+// three-state list rule. The streamed report (links nil, root empty) inlines
+// the diffs it cannot link to.
+func renderReadme(d *Diff, links *readmeLinks, root string) (string, error) {
 	var b strings.Builder
 	fmt.Fprintf(&b, "# %s\n\n", d.Title)
-	renderSummary(&b, d)
-	renderStats(&b, d, links)
-	renderWarnings(&b, d)
-	renderFileTree(&b, d)
-	renderEntitlements(&b, d)
-	renderProvisioning(&b, d)
-	if links == nil || !links.hasResources {
-		renderResourcesInline(&b, d)
+	if note := d.statusNote(); note != "" {
+		b.WriteString(note + "\n")
 	}
-	return b.String()
+
+	// Inputs
+	fmt.Fprintf(&b, "## Inputs\n\n- `%s`\n- `%s`\n\n",
+		filepath.Base(d.Old.IPAPath), filepath.Base(d.New.IPAPath))
+
+	renderSummary(&b, d)
+	renderChangeSurfaceSection(&b, d, links)
+	renderMainBinarySection(&b, d, links)
+	if err := renderMachoGroupSections(&b, d, links, root); err != nil {
+		return "", err
+	}
+	if err := renderPlistsSection(&b, d, links, root); err != nil {
+		return "", err
+	}
+	renderEntitlementsSection(&b, d, links)
+	renderProvisioning(&b, d)
+	if err := renderResourcesSection(&b, d, links, root); err != nil {
+		return "", err
+	}
+	if err := renderHermesSection(&b, d, links, root); err != nil {
+		return "", err
+	}
+	if err := renderFileTreeSection(&b, d, root); err != nil {
+		return "", err
+	}
+	if err := renderWarningsSection(&b, d, root); err != nil {
+		return "", err
+	}
+	b.WriteString("## EOF\n")
+	return b.String(), nil
+}
+
+// statusNote carries the no-change case so an empty diff never renders as a
+// bare title.
+func (d *Diff) statusNote() string {
+	if d.diffEmpty() {
+		// Skipped comparisons (failed opens/parses) leave warnings behind; an
+		// empty result set with warnings is incomplete, not a clean no-op.
+		if len(d.Warnings) > 0 {
+			return "> No differences found; some comparisons were skipped — see Warnings.\n"
+		}
+		return "> No differences found.\n"
+	}
+	return ""
+}
+
+func (d *Diff) diffEmpty() bool {
+	machosEmpty := d.Machos == nil ||
+		(len(d.Machos.New) == 0 && len(d.Machos.Removed) == 0 && len(d.Machos.Updated) == 0)
+	plistsEmpty := d.Plists == nil ||
+		(len(d.Plists.New) == 0 && len(d.Plists.Removed) == 0 && len(d.Plists.Updated) == 0 && len(d.Plists.Raw) == 0)
+	resEmpty := d.Resources == nil ||
+		(len(d.Resources.New) == 0 && len(d.Resources.Removed) == 0 && len(d.Resources.Updated) == 0 && len(d.Resources.SizeOnly) == 0)
+	hermesEmpty := d.Hermes == nil ||
+		(len(d.Hermes.New) == 0 && len(d.Hermes.Removed) == 0 && len(d.Hermes.Updated) == 0)
+	ftEmpty := d.FileTree == nil || (len(d.FileTree.New) == 0 && len(d.FileTree.Removed) == 0)
+	metaEmpty := len(d.ObjC) == 0 && len(d.Swift) == 0 &&
+		strings.TrimSpace(d.Ents) == "" && strings.TrimSpace(d.Provisioning) == ""
+	return machosEmpty && plistsEmpty && resEmpty && hermesEmpty && ftEmpty && metaEmpty
+}
+
+// renderChangeSurfaceSection promotes the per-binary delta table to its own
+// section: it replaces the old Stats bullets as the at-a-glance view.
+func renderChangeSurfaceSection(b *strings.Builder, d *Diff, links *readmeLinks) {
+	if table := renderChangeSurface(d, links); table != "" {
+		b.WriteString("## Change Surface\n\n")
+		b.WriteString(table)
+	}
+}
+
+func renderMainBinarySection(b *strings.Builder, d *Diff, links *readmeLinks) {
+	mainExe := d.New.ExeName
+	if mainExe == "" {
+		mainExe = d.Old.ExeName
+	}
+	b.WriteString("## Main Binary\n\n")
+	renamedOrNew := d.Machos != nil && slices.Contains(d.Machos.New, mainExe)
+	if !mainHasContent(d, mainExe) && !renamedOrNew {
+		b.WriteString("- unchanged\n\n")
+		return
+	}
+	href := ""
+	if links != nil {
+		href = links.main
+	}
+	if href != "" {
+		fmt.Fprintf(b, "#### ⬆️ Updated (1)\n\n- [%s](./%s)\n\n", mainExe, href)
+		return
+	}
+	fmt.Fprintf(b, "#### ⬆️ Updated (1)\n\n- `%s`\n\n", mainExe)
+	renderInlineBinaryDiffs(b, d, []string{mainExe})
+}
+
+// renderMachoGroupSections renders the Frameworks and Plugins groups as
+// counted NEW/Removed/Updated triples over the non-main Mach-O diffs.
+func renderMachoGroupSections(b *strings.Builder, d *Diff, links *readmeLinks, root string) error {
+	mainExe := d.New.ExeName
+	if mainExe == "" {
+		mainExe = d.Old.ExeName
+	}
+	if d.Machos == nil {
+		return nil
+	}
+	// A CFBundleExecutable rename puts the old executable in Removed and the
+	// new one in New; both belong to the Main Binary section, never to the
+	// Frameworks/Plugins groups.
+	renamed := d.Old.ExeName != d.New.ExeName && d.Old.ExeName != "" && d.New.ExeName != ""
+	groups := []struct {
+		heading string
+		match   func(rel string) bool
+		subDir  string
+		label   string
+	}{
+		{"## Frameworks", func(rel string) bool {
+			return strings.HasPrefix(rel, "Frameworks"+string(filepath.Separator))
+		}, "FRAMEWORKS", "Frameworks"},
+		{"## Plugins", func(rel string) bool {
+			return !strings.HasPrefix(rel, "Frameworks"+string(filepath.Separator))
+		}, "PLUGINS", "Plugins"},
+	}
+	for _, g := range groups {
+		var newL, rmL, upL []listLine
+		for _, rel := range d.Machos.New {
+			if rel != mainExe && g.match(rel) {
+				newL = append(newL, listLine{text: rel})
+			}
+		}
+		for _, rel := range d.Machos.Removed {
+			if rel != mainExe && !(renamed && rel == d.Old.ExeName) && g.match(rel) {
+				rmL = append(rmL, listLine{text: rel})
+			}
+		}
+		var upRels []string
+		for rel := range d.Machos.Updated {
+			if rel != mainExe && g.match(rel) {
+				href := ""
+				if links != nil {
+					href = links.binaryFiles[rel]
+				}
+				upL = append(upL, listLine{text: rel, href: href})
+				upRels = append(upRels, rel)
+			}
+		}
+		sortListLines(newL)
+		sortListLines(rmL)
+		sortListLines(upL)
+		if len(newL)+len(rmL)+len(upL) == 0 {
+			continue
+		}
+		b.WriteString(g.heading + "\n\n")
+		if err := renderDiffTriple(b, "####", newL, rmL, upL, root, g.subDir, g.label); err != nil {
+			return err
+		}
+		if links == nil {
+			// Streamed report: there are no side-car pages to link to, so the
+			// diff bodies render inline (collapsed) instead of being lost.
+			renderInlineBinaryDiffs(b, d, upRels)
+		}
+	}
+	return nil
+}
+
+// renderInlineBinaryDiffs emits one collapsed block per binary holding the
+// structural diff plus the Obj-C and Swift sections — the streamed-report
+// equivalent of the per-binary pages.
+func renderInlineBinaryDiffs(b *strings.Builder, d *Diff, rels []string) {
+	for _, rel := range rels {
+		structural := d.Machos.Updated[rel]
+		objc := d.ObjC[rel]
+		swift := d.Swift[rel]
+		if structural == "" && objc == "" && swift == "" {
+			continue
+		}
+		fmt.Fprintf(b, "<details>\n<summary><code>%s</code></summary>\n\n", rel)
+		if structural != "" {
+			b.WriteString(structural)
+			b.WriteString("\n")
+		}
+		if objc != "" {
+			b.WriteString("#### Obj-C\n\n```diff\n")
+			b.WriteString(objc)
+			b.WriteString("\n```\n\n")
+		}
+		if swift != "" {
+			b.WriteString("#### Swift\n\n```diff\n")
+			b.WriteString(swift)
+			b.WriteString("\n```\n\n")
+		}
+		b.WriteString("</details>\n\n")
+	}
+}
+
+func renderPlistsSection(b *strings.Builder, d *Diff, links *readmeLinks, root string) error {
+	pd := d.Plists
+	if pd == nil {
+		return nil
+	}
+	if len(pd.New) == 0 && len(pd.Removed) == 0 && len(pd.Updated) == 0 && len(pd.Raw) == 0 {
+		return nil
+	}
+	b.WriteString("## Plists\n\n")
+	var upL []listLine
+	var inlineKeys []string
+	if links != nil && len(links.plistFiles) > 0 {
+		upL = linkLines(links.plistFiles)
+	} else {
+		// Streamed report: no side-car pages exist; count here, inline below.
+		inlineKeys = mapKeys(pd.Updated)
+		sort.Strings(inlineKeys)
+		upL = nameLines(inlineKeys)
+	}
+	if err := renderDiffTriple(b, "####", nameLines(pd.New), nameLines(pd.Removed), upL, root, "PLISTS", "Plists"); err != nil {
+		return err
+	}
+	if links == nil && len(inlineKeys) > 0 {
+		for _, k := range inlineKeys {
+			fmt.Fprintf(b, "<details>\n<summary><code>%s</code></summary>\n\n%s\n\n</details>\n\n", k, pd.Updated[k])
+		}
+	}
+	if len(pd.Raw) > 0 {
+		fmt.Fprintf(b, "\n> %d plists compared as raw bytes (canonicalization failed; identical files are silent).\n\n", len(pd.Raw))
+	}
+	return nil
+}
+
+func renderEntitlementsSection(b *strings.Builder, d *Diff, links *readmeLinks) {
+	if strings.TrimSpace(d.Ents) == "" {
+		return
+	}
+	b.WriteString("## Entitlements\n\n")
+	count := countEntChanges(d.Ents)
+	if count == 0 {
+		b.WriteString("- unchanged\n\n")
+		return
+	}
+	if links != nil {
+		// The diff lives in the Entitlements.md side-car (file mode).
+		fmt.Fprintf(b, "#### ⬆️ Updated (%d)\n\n- [Entitlements DIFF](./Entitlements.md)\n\n", count)
+		return
+	}
+	fmt.Fprintf(b, "#### ⬆️ Updated (%d)\n\n", count)
+	b.WriteString(d.Ents)
+	b.WriteString("\n")
+}
+
+func renderResourcesSection(b *strings.Builder, d *Diff, links *readmeLinks, root string) error {
+	r := d.Resources
+	if r == nil {
+		return nil
+	}
+	if len(r.New) == 0 && len(r.Removed) == 0 && len(r.Updated) == 0 && len(r.SizeOnly) == 0 {
+		return nil
+	}
+	b.WriteString("## Resources\n\n")
+	var upL []listLine
+	var inlineKeys []string
+	if links != nil && len(links.resourceFiles) > 0 {
+		upL = linkLines(links.resourceFiles)
+	} else if links == nil {
+		inlineKeys = mapKeys(r.Updated)
+		sort.Strings(inlineKeys)
+		upL = nameLines(inlineKeys)
+	}
+	if err := renderDiffTriple(b, "####", nameLines(r.New), nameLines(r.Removed), upL, root, "RESOURCES", "Resources"); err != nil {
+		return err
+	}
+	if links == nil && len(inlineKeys) > 0 {
+		for _, k := range inlineKeys {
+			fmt.Fprintf(b, "<details>\n<summary><code>%s</code></summary>\n\n%s\n\n</details>\n\n", k, r.Updated[k])
+		}
+	}
+	if len(r.SizeOnly) > 0 {
+		keys := mapKeys(r.SizeOnly)
+		sort.Strings(keys)
+		lines := make([]listLine, 0, len(keys))
+		for _, k := range keys {
+			lines = append(lines, listLine{text: fmt.Sprintf("%s — %s", k, r.SizeOnly[k])})
+		}
+		if err := renderCountedList(b, "####", "📦 Size changes (binary)", lines, root, "RESOURCES", "Resources.SizeChanges"); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func renderHermesSection(b *strings.Builder, d *Diff, links *readmeLinks, root string) error {
+	h := d.Hermes
+	if h == nil {
+		return nil
+	}
+	if len(h.New) == 0 && len(h.Removed) == 0 && len(h.Updated) == 0 {
+		return nil
+	}
+	b.WriteString("## Hermes\n\n")
+	var upL []listLine
+	if len(h.Updated) > 0 {
+		keys := make([]string, 0, len(h.Updated))
+		for k := range h.Updated {
+			keys = append(keys, k)
+		}
+		sort.Strings(keys)
+		for _, rel := range keys {
+			item := h.Updated[rel]
+			// File mode: each bundle's sidecar wrote its own README under
+			// HERMES/<bundle>/; link that page directly. There is no
+			// HERMES/README.md aggregate index.
+			if links != nil && item.OutputDir != "" {
+				upL = append(upL, listLine{text: rel, href: item.OutputDir + "/README.md"})
+			} else {
+				upL = append(upL, listLine{text: rel})
+			}
+		}
+	}
+	return renderDiffTriple(b, "####", nameLines(h.New), nameLines(h.Removed), upL, root, "HERMES", "Hermes")
+}
+
+func renderProvisioning(b *strings.Builder, d *Diff) {
+	if strings.TrimSpace(d.Provisioning) == "" {
+		return
+	}
+	b.WriteString("## Provisioning Profile\n\n")
+	b.WriteString(d.Provisioning)
+	b.WriteString("\n\n")
+}
+
+func renderFileTreeSection(b *strings.Builder, d *Diff, root string) error {
+	if d.FileTree == nil {
+		return nil
+	}
+	if len(d.FileTree.New) == 0 && len(d.FileTree.Removed) == 0 {
+		return nil
+	}
+	b.WriteString("## File Tree\n\n")
+	return renderDiffTriple(b, "####", nameLines(d.FileTree.New), nameLines(d.FileTree.Removed), nil, root, "FILE_TREE", "FileTree")
+}
+
+func renderWarningsSection(b *strings.Builder, d *Diff, root string) error {
+	if len(d.Warnings) == 0 {
+		return nil
+	}
+	lines := make([]listLine, 0, len(d.Warnings))
+	for _, w := range d.Warnings {
+		label := w.Section
+		if w.Path != "" {
+			label += "/" + w.Path
+		}
+		lines = append(lines, listLine{text: fmt.Sprintf("%s — %s", label, w.Message)})
+	}
+	b.WriteString("## Warnings\n\n")
+	return renderCountedList(b, "####", "Skipped / degraded", lines, root, "", "Warnings")
+}
+
+func sortListLines(lines []listLine) {
+	sort.Slice(lines, func(i, j int) bool { return lines[i].text < lines[j].text })
 }
 
 func renderSummary(b *strings.Builder, d *Diff) {
@@ -455,100 +995,123 @@ func renderSummary(b *strings.Builder, d *Diff) {
 	b.WriteString("\n")
 }
 
-// renderStats produces the section-by-section dashboard. Counts come from
-// the diff struct; links point at per-binary files (main) or per-section
-// dirs (FRAMEWORKS / PLUGINS / PLISTS).
-func renderStats(b *strings.Builder, d *Diff, links *readmeLinks) {
-	b.WriteString("## Stats\n\n")
-
-	mainExe := d.New.ExeName
-	if mainExe == "" {
-		mainExe = d.Old.ExeName
+// renderChangeSurface renders one row per binary whose comparison changed,
+// sorted by how much moved, so a reader sees WHERE the release changed
+// before opening any per-binary page. Counts are the normalized set deltas
+// the diff engine compares (build-path/counter noise already collapsed).
+func renderChangeSurface(d *Diff, links *readmeLinks) string {
+	type row struct {
+		rel                string
+		symAdd, symDel     int
+		csAdd, csDel       int
+		funcDelta          int
+		objc, swift, macho bool
+		newOrRemoved       string
 	}
 
-	// Main binary status.
-	mainChanged := mainHasContent(d, mainExe)
-	switch {
-	case mainChanged && links != nil && links.main != "":
-		fmt.Fprintf(b, "- **Main binary** — updated → [%s](./%s)\n", mainExe, links.main)
-	case mainChanged:
-		fmt.Fprintf(b, "- **Main binary** (`%s`) — updated\n", mainExe)
-	default:
-		fmt.Fprintf(b, "- **Main binary** (`%s`) — unchanged\n", mainExe)
-	}
-
-	// Mach-Os: roll up across non-main binaries.
-	if d.Machos != nil {
-		nonMainUpdated := 0
-		for k := range d.Machos.Updated {
-			if k != mainExe {
-				nonMainUpdated++
+	seen := make(map[string]struct{})
+	var rels []string
+	collect := func(m map[string]*vmacho.DiffInfo) {
+		for rel := range m {
+			if _, ok := seen[rel]; !ok {
+				seen[rel] = struct{}{}
+				rels = append(rels, rel)
 			}
 		}
-		var dirs []string
-		if links != nil && links.hasFrameworks {
-			dirs = append(dirs, "[FRAMEWORKS/](./FRAMEWORKS/)")
-		}
-		if links != nil && links.hasPlugins {
-			dirs = append(dirs, "[PLUGINS/](./PLUGINS/)")
-		}
-		suffix := ""
-		if len(dirs) > 0 {
-			suffix = " → " + strings.Join(dirs, ", ")
-		}
-		fmt.Fprintf(b, "- **Mach-Os** — %d new, %d removed, %d updated%s\n",
-			len(d.Machos.New), len(d.Machos.Removed), nonMainUpdated, suffix)
 	}
-
-	// Plists.
-	if d.Plists != nil {
-		suffix := ""
-		if links != nil && links.hasPlists {
-			suffix = " → [PLISTS/](./PLISTS/)"
-		}
-		fmt.Fprintf(b, "- **Plists** — %d new, %d removed, %d updated%s\n",
-			len(d.Plists.New), len(d.Plists.Removed), plistUpdatedCount(d.Plists), suffix)
-	}
-
-	// Entitlements: count "###" headers in the rendered diff (one per
-	// changed binary). The vendored DiffDatabases output uses "### " as
-	// the per-binary header.
-	if strings.TrimSpace(d.Ents) != "" {
-		entChanges := countEntChanges(d.Ents)
-		if entChanges > 0 {
-			fmt.Fprintf(b, "- **Entitlements** — %d changed (inline below)\n", entChanges)
-		} else {
-			b.WriteString("- **Entitlements** — unchanged\n")
+	collect(d.oldInfos)
+	collect(d.newInfos)
+	for rel := range d.ObjC {
+		if _, ok := seen[rel]; !ok {
+			seen[rel] = struct{}{}
+			rels = append(rels, rel)
 		}
 	}
-
-	// Provisioning.
-	if strings.TrimSpace(d.Provisioning) != "" {
-		b.WriteString("- **Provisioning profile** — changed (inline below)\n")
-	}
-
-	// Resources.
-	if d.Resources != nil {
-		suffix := ""
-		if links != nil && links.hasResources {
-			suffix = " → [RESOURCES/](./RESOURCES/)"
+	for rel := range d.Swift {
+		if _, ok := seen[rel]; !ok {
+			seen[rel] = struct{}{}
+			rels = append(rels, rel)
 		}
-		fmt.Fprintf(b, "- **Resources** — %d new, %d removed, %d text updated, %d size-only%s\n",
-			len(d.Resources.New), len(d.Resources.Removed),
-			len(d.Resources.Updated), len(d.Resources.SizeOnly), suffix)
 	}
+	sort.Strings(rels)
 
-	// Hermes.
-	if d.Hermes != nil {
-		suffix := ""
-		if links != nil && links.hasHermes {
-			suffix = " → [HERMES/](./HERMES/)"
+	ignoreTimestamps := d.cfg != nil && d.cfg.IgnoreBuildTimestamps
+	var rows []row
+	for _, rel := range rels {
+		r := row{rel: rel}
+		switch {
+		case d.oldInfos[rel] == nil && d.newInfos[rel] != nil:
+			r.newOrRemoved = "new"
+		case d.oldInfos[rel] != nil && d.newInfos[rel] == nil:
+			r.newOrRemoved = "removed"
+		default:
+			r.symAdd, r.symDel, r.csAdd, r.csDel, r.funcDelta = vmacho.DiffCounts(d.oldInfos[rel], d.newInfos[rel], ignoreTimestamps)
 		}
-		fmt.Fprintf(b, "- **Hermes bundles** — %d new, %d removed, %d updated%s\n",
-			len(d.Hermes.New), len(d.Hermes.Removed), len(d.Hermes.Updated), suffix)
+		_, r.macho = d.Machos.Updated[rel]
+		r.objc = d.ObjC[rel] != ""
+		r.swift = d.Swift[rel] != ""
+		if r.newOrRemoved == "" && !r.macho && !r.objc && !r.swift &&
+			r.symAdd == 0 && r.symDel == 0 && r.csAdd == 0 && r.csDel == 0 && r.funcDelta == 0 {
+			continue
+		}
+		rows = append(rows, r)
+	}
+	if len(rows) == 0 {
+		return ""
 	}
 
+	// Loudest first: total moved entries, then binary name for stability.
+	sort.Slice(rows, func(i, j int) bool {
+		ti := abs(rows[i].symAdd+rows[i].symDel+rows[i].csAdd+rows[i].csDel) + abs(rows[i].funcDelta)
+		tj := abs(rows[j].symAdd+rows[j].symDel+rows[j].csAdd+rows[j].csDel) + abs(rows[j].funcDelta)
+		if ti != tj {
+			return ti > tj
+		}
+		return rows[i].rel < rows[j].rel
+	})
+
+	var b strings.Builder
+	b.WriteString("| Binary | Symbols | Strings | Functions | Obj-C | Swift | Structural |\n")
+	b.WriteString("| :-- | :-- | :-- | :-- | :-- | :-- | :-- |\n")
+	for _, r := range rows {
+		name := r.rel
+		if links != nil {
+			if file := links.binaryFiles[r.rel]; file != "" {
+				name = fmt.Sprintf("[%s](./%s)", r.rel, file)
+			}
+		}
+		sym := "—"
+		if r.newOrRemoved != "" {
+			sym = r.newOrRemoved
+		} else if r.symAdd+r.symDel > 0 {
+			sym = fmt.Sprintf("+%d / −%d", r.symAdd, r.symDel)
+		}
+		strs := "—"
+		if r.csAdd+r.csDel > 0 {
+			strs = fmt.Sprintf("+%d / −%d", r.csAdd, r.csDel)
+		}
+		fns := "—"
+		if r.funcDelta != 0 {
+			fns = fmt.Sprintf("%+d", r.funcDelta)
+		}
+		yesNo := func(v bool) string {
+			if v {
+				return "changed"
+			}
+			return "—"
+		}
+		fmt.Fprintf(&b, "| %s | %s | %s | %s | %s | %s | %s |\n",
+			name, sym, strs, fns, yesNo(r.objc), yesNo(r.swift), yesNo(r.macho))
+	}
 	b.WriteString("\n")
+	return b.String()
+}
+
+func abs(n int) int {
+	if n < 0 {
+		return -n
+	}
+	return n
 }
 
 // mainHasContent reports whether the main app binary has any updated
@@ -579,99 +1142,10 @@ func countEntChanges(ents string) int {
 	return count
 }
 
-func renderWarnings(b *strings.Builder, d *Diff) {
-	if len(d.Warnings) == 0 {
-		return
-	}
-	b.WriteString("## Warnings\n\n")
-	for _, warning := range d.Warnings {
-		label := warning.Section
-		if warning.Path != "" {
-			label += "/" + warning.Path
-		}
-		fmt.Fprintf(b, "- `%s` — %s\n", label, warning.Message)
-	}
-	b.WriteString("\n")
-}
-
-func renderFileTree(b *strings.Builder, d *Diff) {
-	if d.FileTree == nil {
-		return
-	}
-	if len(d.FileTree.New) == 0 && len(d.FileTree.Removed) == 0 {
-		return
-	}
-	b.WriteString("## File Tree\n\n")
-	listBlock(b, "🆕 New", d.FileTree.New)
-	listBlock(b, "❌ Removed", d.FileTree.Removed)
-}
-
-func renderEntitlements(b *strings.Builder, d *Diff) {
-	if strings.TrimSpace(d.Ents) == "" {
-		return
-	}
-	b.WriteString("## Entitlements\n\n")
-	b.WriteString(d.Ents)
-	b.WriteString("\n")
-}
-
-func renderProvisioning(b *strings.Builder, d *Diff) {
-	if strings.TrimSpace(d.Provisioning) == "" {
-		return
-	}
-	b.WriteString("## Provisioning Profile\n\n")
-	b.WriteString(d.Provisioning)
-	b.WriteString("\n\n")
-}
-
-func renderResourcesInline(b *strings.Builder, d *Diff) {
-	r := d.Resources
-	if r == nil {
-		return
-	}
-	if len(r.New) == 0 && len(r.Removed) == 0 && len(r.Updated) == 0 && len(r.SizeOnly) == 0 {
-		return
-	}
-	b.WriteString("## Resources\n\n")
-	listBlock(b, "🆕 New", r.New)
-	listBlock(b, "❌ Removed", r.Removed)
-
-	if len(r.Updated) > 0 {
-		fmt.Fprintf(b, "### ⬆️ Updated (text) (%d)\n\n", len(r.Updated))
-		keys := mapKeys(r.Updated)
-		sort.Strings(keys)
-		for _, k := range keys {
-			fmt.Fprintf(b, "<details>\n<summary><code>%s</code></summary>\n\n%s\n\n</details>\n\n", k, r.Updated[k])
-		}
-	}
-
-	if len(r.SizeOnly) > 0 {
-		b.WriteString("### 📦 Size changes (binary)\n\n")
-		keys := mapKeys(r.SizeOnly)
-		sort.Strings(keys)
-		for _, k := range keys {
-			fmt.Fprintf(b, "- `%s` — %s\n", k, r.SizeOnly[k])
-		}
-		b.WriteString("\n")
-	}
-}
-
 type resourcePage struct {
 	displayPath string
 	fileName    string
 	body        string
-}
-
-func shouldSpillResources(r *ResourcesDiff) bool {
-	if r == nil {
-		return false
-	}
-	if len(r.Updated) > spillEntryThreshold {
-		return true
-	}
-	var b strings.Builder
-	renderResourcesInline(&b, &Diff{Resources: r})
-	return b.Len() > spillByteThreshold
 }
 
 func buildResourcePages(r *ResourcesDiff) []resourcePage {
@@ -732,6 +1206,11 @@ func renderResourceIndex(r *ResourcesDiff, pages []resourcePage) string {
 type plistPage struct {
 	displayPath string
 	body        string
+	// dedupeKey identifies the diff content of the page: pages that share a
+	// key show the same change (bundles replicated across appexes) and are
+	// merged by dedupePlistPages. Empty means "dedupe on the body minus the
+	// title line".
+	dedupeKey string
 }
 
 type localizedPlistGroup struct {
@@ -781,6 +1260,7 @@ func buildPlistPages(pd *PlistDiff) []plistPage {
 			pages = append(pages, plistPage{
 				displayPath: rel,
 				body:        fmt.Sprintf("# %s\n\n%s\n", rel, diff),
+				dedupeKey:   diff,
 			})
 			continue
 		}
@@ -809,6 +1289,7 @@ func buildPlistPages(pd *PlistDiff) []plistPage {
 				pages = append(pages, plistPage{
 					displayPath: rel,
 					body:        fmt.Sprintf("# %s\n\n%s\n", rel, diff),
+					dedupeKey:   diff,
 				})
 			}
 			continue
@@ -816,13 +1297,173 @@ func buildPlistPages(pd *PlistDiff) []plistPage {
 		pages = append(pages, plistPage{
 			displayPath: group.displayPath,
 			body:        renderLocalizedPlistPage(group),
+			dedupeKey:   localizedDedupeKey(group),
 		})
 	}
 
 	sort.Slice(pages, func(i, j int) bool {
 		return pages[i].displayPath < pages[j].displayPath
 	})
-	return pages
+	return dedupePlistPages(pages)
+}
+
+// dedupePlistPages merges pages whose diff content is identical: bundles
+// replicated across appexes (the same momd, localization bundle, or framework
+// copied into every extension) otherwise render the same diff once per copy.
+// The alphabetically first path becomes the representative; the rest are
+// listed under a "Same diff in" note.
+func dedupePlistPages(pages []plistPage) []plistPage {
+	if len(pages) < 2 {
+		return pages
+	}
+	type group struct {
+		paths []string
+		page  plistPage
+	}
+	groups := make(map[string]*group)
+	var order []string
+	for _, p := range pages {
+		key := p.dedupeKey
+		if key == "" {
+			// Fall back to the body without the leading "# <path>\n\n" title.
+			key = p.body
+			if idx := strings.Index(p.body, "\n"); idx >= 0 {
+				key = p.body[idx+1:]
+			}
+		}
+		g := groups[key]
+		if g == nil {
+			g = &group{page: p}
+			groups[key] = g
+			order = append(order, key)
+		}
+		g.paths = append(g.paths, p.displayPath)
+	}
+
+	var out []plistPage
+	for _, key := range order {
+		g := groups[key]
+		p := g.page
+		if len(g.paths) > 1 {
+			p.body = insertSameDiffNote(p.body, g.paths[1:])
+		}
+		out = append(out, p)
+	}
+	sort.Slice(out, func(i, j int) bool {
+		return out[i].displayPath < out[j].displayPath
+	})
+	return out
+}
+
+// localizedDedupeKey merges localized family pages only when BOTH the
+// representative diff and the locale set match: the same bundle copied into
+// appexes carries identical locale directories and dedupes, but two bundles
+// whose en diff matches while their locale sets differ keep separate pages —
+// merging them would hide the second family's locale list.
+func localizedDedupeKey(group *localizedPlistGroup) string {
+	paths := mapKeys(group.diffByRel)
+	sort.Slice(paths, func(i, j int) bool {
+		li, lj := group.localeByRel[paths[i]], group.localeByRel[paths[j]]
+		if localeSortRank(li) != localeSortRank(lj) {
+			return localeSortRank(li) < localeSortRank(lj)
+		}
+		if li != lj {
+			return li < lj
+		}
+		return paths[i] < paths[j]
+	})
+	locales := make([]string, 0, len(paths))
+	for _, rel := range paths {
+		locales = append(locales, group.localeByRel[rel])
+	}
+	sort.Strings(locales)
+	return group.diffByRel[paths[0]] + "\x00" + strings.Join(locales, ",")
+}
+
+// ----- binary page dedupe --------------------------------------------------
+
+// binaryPage is one rendered per-binary report page on its way to disk.
+type binaryPage struct {
+	rel, fname, body string
+}
+
+// dedupeBinaryPages merges binary pages whose rendered bodies are identical
+// after the "# path" title: the same framework binary copied into the main
+// app and every appex produces one comparison, not one per copy. The first
+// page in order keeps its full body with a "Same diff in" note; the rest
+// become stubs linking to it, so every README link still resolves.
+func dedupeBinaryPages(pages []binaryPage) []binaryPage {
+	if len(pages) < 2 {
+		return pages
+	}
+	type group struct {
+		pages []binaryPage
+	}
+	groups := make(map[string]*group)
+	var order []string
+	for _, p := range pages {
+		key := p.body
+		if idx := strings.Index(p.body, "\n\n"); idx >= 0 {
+			key = p.body[idx+2:]
+		}
+		g := groups[key]
+		if g == nil {
+			g = &group{}
+			groups[key] = g
+			order = append(order, key)
+		}
+		g.pages = append(g.pages, p)
+	}
+
+	var out []binaryPage
+	for _, key := range order {
+		g := groups[key]
+		head := g.pages[0]
+		if len(g.pages) > 1 {
+			var rest []string
+			for _, other := range g.pages[1:] {
+				rest = append(rest, other.rel)
+			}
+			head.body = insertSameDiffNote(head.body, rest)
+			out = append(out, head)
+			for _, other := range g.pages[1:] {
+				out = append(out, stubBinaryPage(head, other))
+			}
+			continue
+		}
+		out = append(out, head)
+	}
+	return out
+}
+
+// stubBinaryPage builds the short pointer page written for a duplicated
+// binary copy, linking to the representative page by a root-relative path.
+func stubBinaryPage(head, other binaryPage) binaryPage {
+	link, err := filepath.Rel(filepath.Dir(other.fname), head.fname)
+	if err != nil {
+		link = head.fname
+	}
+	return binaryPage{
+		rel:   other.rel,
+		fname: other.fname,
+		body: fmt.Sprintf("# %s\n\n> Same diff as [%s](%s) — this copy of the binary compared identically; the full page lives there.\n",
+			other.rel, head.rel, link),
+	}
+}
+
+// insertSameDiffNote inserts the "Same diff in" note between the page's
+// title line and the diff content.
+func insertSameDiffNote(body string, paths []string) string {
+	quoted := make([]string, len(paths))
+	for i, p := range paths {
+		quoted[i] = "`" + p + "`"
+	}
+	note := "> Same diff in: " + strings.Join(quoted, ", ") + "\n"
+	idx := strings.Index(body, "\n\n")
+	if idx < 0 {
+		return body + "\n" + note
+	}
+	return body[:idx] + "\n" + note + body[idx+1:]
 }
 
 func plistUpdatedCount(pd *PlistDiff) int {

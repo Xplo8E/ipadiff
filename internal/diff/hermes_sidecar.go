@@ -48,20 +48,35 @@ func (d *Diff) writeHermesFiles(root string) (bool, error) {
 
 	keys := mapKeysHermes(d.Hermes.Updated)
 	sort.Strings(keys)
+
+	// Reserve one output dir per bundle up front so names stay deterministic
+	// when the sidecar runs are parallelized below.
 	used := map[string]bool{}
+	dirNames := make(map[string]string, len(keys))
 	for _, rel := range keys {
+		dirNames[rel] = uniqueDirName(used, TitleToFilename(safeName(rel)))
+	}
+
+	// Run one sidecar invocation per changed bundle, in parallel like every
+	// other per-file phase. The snapshot inputs live in private temp dirs, so
+	// the workers share no mutable state; results (including warnings) are
+	// applied serially afterwards to keep ordering deterministic.
+	type sidecarResult struct {
+		rel       string
+		outputDir string
+		warning   string
+	}
+	results := runStringWorkers(keys, d.cfg.Workers, func(rel string) sidecarResult {
 		item := d.Hermes.Updated[rel]
-		oldInput, newInput := item.sidecarInputs(d.Old.AppDir, d.New.AppDir)
+		oldInput, newInput := item.sidecarInputs()
 		if oldInput == "" || newInput == "" {
-			msg := "Hermes input snapshot unavailable"
-			item.Warning = msg
-			d.addWarning("hermes", rel, msg)
-			continue
+			return sidecarResult{rel: rel, warning: "Hermes input snapshot unavailable"}
 		}
-		dirName := uniqueDirName(used, TitleToFilename(safeName(rel)))
+		dirName := dirNames[rel]
 		outDir := filepath.Join(hermesRoot, dirName)
 
 		ctx, cancel := context.WithTimeout(context.Background(), d.hermesTimeout())
+		defer cancel()
 		cmd := exec.CommandContext(
 			ctx,
 			tool,
@@ -72,7 +87,6 @@ func (d *Diff) writeHermesFiles(root string) (bool, error) {
 			"--out-dir", outDir,
 		)
 		output, err := cmd.CombinedOutput()
-		cancel()
 		item.cleanupInputs()
 		if err != nil {
 			msg := fmt.Sprintf("hermes-diff failed: %v", err)
@@ -82,30 +96,41 @@ func (d *Diff) writeHermesFiles(root string) (bool, error) {
 			if trimmed := strings.TrimSpace(string(output)); trimmed != "" {
 				msg += ": " + truncateWarning(trimmed, 800)
 			}
-			item.Warning = msg
-			d.addWarning("hermes", rel, msg)
-			continue
+			return sidecarResult{rel: rel, warning: msg}
 		}
 
-		item.OutputDir = filepath.ToSlash(filepath.Join("HERMES", dirName))
+		res := sidecarResult{
+			rel:       rel,
+			outputDir: filepath.ToSlash(filepath.Join("HERMES", dirName)),
+		}
 		if err := item.loadHermesManifest(filepath.Join(outDir, "manifest.json")); err != nil {
-			msg := "read manifest failed: " + err.Error()
-			item.Warning = msg
-			d.addWarning("hermes", rel, msg)
+			res.warning = "read manifest failed: " + err.Error()
+		}
+		return res
+	})
+	for _, result := range results {
+		item := d.Hermes.Updated[result.rel]
+		if result.outputDir != "" {
+			item.OutputDir = result.outputDir
+		}
+		if result.warning != "" {
+			item.Warning = result.warning
+			d.addWarning("hermes", result.rel, result.warning)
 		}
 	}
 	d.sortWarnings()
 	return true, nil
 }
 
-func (h *HermesBundleDiff) sidecarInputs(oldRoot, newRoot string) (string, string) {
+// sidecarInputs returns the private snapshot paths for both sides. Snapshots
+// are written during diffHermes because the IPA temp extraction dirs are torn
+// down when Run returns — a missing snapshot is an error, never a fallback to
+// the (already deleted) extraction paths.
+func (h *HermesBundleDiff) sidecarInputs() (string, string) {
 	if h.oldInput != "" && h.newInput != "" {
 		return h.oldInput, h.newInput
 	}
-	if h.Path == "" {
-		return "", ""
-	}
-	return filepath.Join(oldRoot, h.Path), filepath.Join(newRoot, h.Path)
+	return "", ""
 }
 
 func (d *Diff) hermesInputLabel(ipaPath, rel string) string {

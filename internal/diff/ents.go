@@ -29,13 +29,16 @@ func (d *Diff) buildEntDB(side string, b *bundle.Bundle) map[string]string {
 	targets := append([]string{b.ExeName}, b.Frameworks...)
 	for _, rel := range targets {
 		full := filepath.Join(b.AppDir, rel)
-		m, err := openMacho(full)
+		ms, closeSlices, err := openSlices(full)
 		if err != nil {
 			d.addWarning("entitlements", rel, side+": open Mach-O failed: "+err.Error())
 			continue
 		}
+		// preferredEntitlementSlice also warns when slices disagree on
+		// entitlements or launch constraints.
+		m := preferredEntitlementSlice(full, ms)
 		ent := parsers.ReadFromMacho(m)
-		m.Close()
+		closeSlices()
 
 		combined := ent.Combined()
 		if combined == "" {

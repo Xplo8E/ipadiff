@@ -27,6 +27,25 @@ type Config struct {
 	NoObjC        bool
 	NoSwift       bool
 	SkipResources bool
+	KeepBuildKeys bool // keep Xcode/toolchain build-metadata keys in plist diffs
+
+	// IgnoreBuildTimestamps collapses __DATE__/__TIME__/__TIMESTAMP__ cstrings
+	// to a placeholder so timestamp-only rebuild noise does not show as diffs.
+	IgnoreBuildTimestamps bool
+	// IgnoreLoadCommands skips the Mach header + load-command structural
+	// digest. Standalone IPA binaries should compare load commands (default);
+	// the knob exists for library callers diffing container-relocated images.
+	IgnoreLoadCommands bool
+
+	// Facts emits machine-readable per-binary comparison facts (sections,
+	// load commands, entitlements, launch constraints) as facts.json in the
+	// multi-file report directory. Streamed Markdown output ignores this.
+	Facts bool
+	// FactsFunctionStarts keeps the per-function start/end address arrays in
+	// facts.json. They dominate the file size (hundreds of thousands of
+	// entries per binary) and are off by default; the section content hashes
+	// and load-command digest already carry the change signal.
+	FactsFunctionStarts bool
 
 	AllowList []string // glob filter on Mach-O section names (Seg.Section)
 	BlockList []string
@@ -64,10 +83,14 @@ func (c *Config) Defaults() {
 }
 
 // PlistDiff records new / removed / updated plists (by bundle-relative path).
+// Raw lists the common paths compared as raw text because plist
+// canonicalization failed on at least one side (OpenStep-format .strings and
+// friends); their diffs are real byte diffs, so identical files stay silent.
 type PlistDiff struct {
 	New     []string          `json:"new,omitempty"`
 	Removed []string          `json:"removed,omitempty"`
 	Updated map[string]string `json:"updated,omitempty"`
+	Raw     []string          `json:"raw,omitempty"`
 }
 
 // ResourcesDiff splits non-plist, non-macho file diffs by treatment.
@@ -134,6 +157,11 @@ type Diff struct {
 	mainNew  *vmacho.DiffInfo
 	oldInfos map[string]*vmacho.DiffInfo
 	newInfos map[string]*vmacho.DiffInfo
+
+	// Per-binary comparison facts for both sides, keyed by bundle-relative
+	// path. Populated only when cfg.Facts is set.
+	factsOld map[string]*vmacho.ComparisonFacts
+	factsNew map[string]*vmacho.ComparisonFacts
 
 	cfg *Config
 }

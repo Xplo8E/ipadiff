@@ -92,6 +92,9 @@ The inner report directory is still derived from bundle metadata:
 | `--no-objc` | false | Skip Obj-C metadata diffs |
 | `--no-swift` | false | Skip Swift metadata diffs |
 | `--skip-resources` | false | Skip text-resource diffs |
+| `--ignore-build-timestamps` | false | Collapse `__DATE__`/`__TIME__`/`__TIMESTAMP__` cstrings to a placeholder |
+| `--facts` | false | Write `facts.json` with per-binary machine-readable comparison facts (multi-file output only) |
+| `--facts-function-starts` | false | Keep per-function start/end arrays in `facts.json` (default: omitted, they dominate the file size) |
 | `--allow-list` | none | Mach-O sections to include, for example `__TEXT.__text` |
 | `--block-list` | none | Mach-O sections to exclude |
 | `--workers` | `GOMAXPROCS` | Parallel workers for per-binary and per-file phases |
@@ -102,8 +105,11 @@ The inner report directory is still derived from bundle metadata:
 ```text
 <outer>/<bundleID>_<oldVersion>_<newVersion>/
 ├── README.md
+├── Entitlements.md
 ├── <BundleName>.md
-├── MACHOS/
+├── facts.json
+├── FRAMEWORKS/
+├── PLUGINS/
 ├── HERMES/
 │   └── main_jsbundle/
 │       ├── README.md
@@ -114,7 +120,7 @@ The inner report directory is still derived from bundle metadata:
 └── RESOURCES/
 ```
 
-Only sections with content are written. Large sections spill into their own directories and are linked from the top-level report.
+Only directories with content are written. The README is a pure index — title, `## Inputs`, Bundle Summary, the Change Surface table, then counted `#### 🆕 NEW (n) / ❌ Removed (n) / ⬆️ Updated (n)` triples per group (Main Binary, Frameworks, Plugins, Plists, Entitlements, Resources, Hermes, File Tree, Warnings) under one uniform list rule: fewer than 30 entries render as plain bullets, up to 1000 collapse into `<details>`, anything larger spills to a side-car doc behind a single "View N" link. Entitlements live in the `Entitlements.md` side-car; binary copies that compared identically collapse into stub pages pointing at the representative. `facts.json` is written only with `--facts` and carries machine-readable per-binary comparison facts (policy, section content hashes, load-command digest, entitlements, launch constraints) for both sides, keyed by bundle-relative path.
 
 ## Hermes Support
 

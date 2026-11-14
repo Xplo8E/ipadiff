@@ -4,6 +4,15 @@
 // machinery (~2300 LoC) because it pulls in dyld_shared_cache, tbd, chroma,
 // and other deps we don't need. The go-macho library already exposes
 // Verbose() / String() methods on the relevant types — we just walk them.
+//
+// Note: go-macho v1.1.296's Swift Type renderer prints stray debug lines to
+// the process stdout when a class or struct generic requirement hits the
+// default branch of its kind switch (types/swift/types.go
+// `fmt.Println(req.Flags.String())`; still on go-macho master as of
+// 2026-11-14). The Swift dumping here can trigger it, so the metadata diff
+// phases in internal/diff run behind a phase-level stdout capture
+// (swallowStdoutDuring) instead of each call guarding itself — that keeps
+// the workers lock-free and fully parallel.
 package vmacho
 
 import (

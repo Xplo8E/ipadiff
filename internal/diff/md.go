@@ -294,18 +294,20 @@ func (d *Diff) writeMultiFile(output string) error {
 	hasFrameworkDir := false
 	hasPluginDir := false
 
+	// Render every binary page first, then deduplicate: the same framework
+	// binary copied into the main app and every appex otherwise renders the
+	// identical comparison once per copy. The first page in order stays full
+	// with a "Same diff in" note; the others become stubs pointing at it, so
+	// every README link still resolves.
+	var pages []binaryPage
 	for _, rel := range d.allBinaryRelPaths() {
 		body := renderBinaryFile(rel, d)
 		kind := classifyBinary(rel, mainExe)
-
+		var fname string
 		switch kind {
 		case binMain:
-			fname := uniqueName(used, d.MainFileName()+".md")
-			if err := os.WriteFile(filepath.Join(root, fname), []byte(body), 0o644); err != nil {
-				return err
-			}
+			fname = uniqueName(used, d.MainFileName()+".md")
 			links.main = fname
-			links.binaryFiles[rel] = fname
 		case binFramework:
 			if !hasFrameworkDir {
 				if err := os.MkdirAll(filepath.Join(root, "FRAMEWORKS"), 0o755); err != nil {
@@ -313,12 +315,7 @@ func (d *Diff) writeMultiFile(output string) error {
 				}
 				hasFrameworkDir = true
 			}
-			rel2 := "FRAMEWORKS" + string(filepath.Separator) + niceBinaryFileName(rel)
-			rel2 = uniqueName(used, rel2)
-			if err := os.WriteFile(filepath.Join(root, rel2), []byte(body), 0o644); err != nil {
-				return err
-			}
-			links.binaryFiles[rel] = rel2
+			fname = uniqueName(used, "FRAMEWORKS"+string(filepath.Separator)+niceBinaryFileName(rel))
 		case binPlugin:
 			if !hasPluginDir {
 				if err := os.MkdirAll(filepath.Join(root, "PLUGINS"), 0o755); err != nil {
@@ -326,12 +323,14 @@ func (d *Diff) writeMultiFile(output string) error {
 				}
 				hasPluginDir = true
 			}
-			rel2 := "PLUGINS" + string(filepath.Separator) + niceBinaryFileName(rel)
-			rel2 = uniqueName(used, rel2)
-			if err := os.WriteFile(filepath.Join(root, rel2), []byte(body), 0o644); err != nil {
-				return err
-			}
-			links.binaryFiles[rel] = rel2
+			fname = uniqueName(used, "PLUGINS"+string(filepath.Separator)+niceBinaryFileName(rel))
+		}
+		links.binaryFiles[rel] = fname
+		pages = append(pages, binaryPage{rel: rel, fname: fname, body: body})
+	}
+	for _, p := range dedupeBinaryPages(pages) {
+		if err := os.WriteFile(filepath.Join(root, p.fname), []byte(p.body), 0o644); err != nil {
+			return err
 		}
 	}
 	links.hasFrameworks = hasFrameworkDir
@@ -391,10 +390,18 @@ func (d *Diff) writeMultiFile(output string) error {
 // sides, keyed by bundle-relative path. Each binary's facts carry the policy
 // that produced them, section content hashes, the load-command digest, and
 // the code signature's entitlements + launch constraints, so scripted
-// consumers can diff the JSON without re-parsing Mach-Os.
+// consumers can diff the JSON without re-parsing Mach-Os. The per-function
+// start/end arrays are dropped unless cfg.FactsFunctionStarts is set: they
+// dominate the file size (hundreds of thousands of entries per binary) while
+// the section content hashes and load-command digest already carry the
+// change signal.
 func (d *Diff) writeFacts(root string) error {
 	if len(d.factsOld) == 0 && len(d.factsNew) == 0 {
 		return nil
+	}
+	if !d.cfg.FactsFunctionStarts {
+		stripFunctionStarts(d.factsOld)
+		stripFunctionStarts(d.factsNew)
 	}
 	type factsFile struct {
 		Schema string                             `json:"schema"`
@@ -410,6 +417,14 @@ func (d *Diff) writeFacts(root string) error {
 		return err
 	}
 	return os.WriteFile(filepath.Join(root, "facts.json"), append(data, '\n'), 0o644)
+}
+
+func stripFunctionStarts(facts map[string]*vmacho.ComparisonFacts) {
+	for _, f := range facts {
+		if f != nil {
+			f.FunctionStarts = nil
+		}
+	}
 }
 
 func (d *Diff) safeOutputRoot(output string) (string, error) {
@@ -1056,6 +1071,77 @@ func localizedRepresentativeDiff(group *localizedPlistGroup) string {
 		return paths[i] < paths[j]
 	})
 	return group.diffByRel[paths[0]]
+}
+
+// ----- binary page dedupe --------------------------------------------------
+
+// binaryPage is one rendered per-binary report page on its way to disk.
+type binaryPage struct {
+	rel, fname, body string
+}
+
+// dedupeBinaryPages merges binary pages whose rendered bodies are identical
+// after the "# path" title: the same framework binary copied into the main
+// app and every appex produces one comparison, not one per copy. The first
+// page in order keeps its full body with a "Same diff in" note; the rest
+// become stubs linking to it, so every README link still resolves.
+func dedupeBinaryPages(pages []binaryPage) []binaryPage {
+	if len(pages) < 2 {
+		return pages
+	}
+	type group struct {
+		pages []binaryPage
+	}
+	groups := make(map[string]*group)
+	var order []string
+	for _, p := range pages {
+		key := p.body
+		if idx := strings.Index(p.body, "\n\n"); idx >= 0 {
+			key = p.body[idx+2:]
+		}
+		g := groups[key]
+		if g == nil {
+			g = &group{}
+			groups[key] = g
+			order = append(order, key)
+		}
+		g.pages = append(g.pages, p)
+	}
+
+	var out []binaryPage
+	for _, key := range order {
+		g := groups[key]
+		head := g.pages[0]
+		if len(g.pages) > 1 {
+			var rest []string
+			for _, other := range g.pages[1:] {
+				rest = append(rest, other.rel)
+			}
+			head.body = insertSameDiffNote(head.body, rest)
+			out = append(out, head)
+			for _, other := range g.pages[1:] {
+				out = append(out, stubBinaryPage(head, other))
+			}
+			continue
+		}
+		out = append(out, head)
+	}
+	return out
+}
+
+// stubBinaryPage builds the short pointer page written for a duplicated
+// binary copy, linking to the representative page by a root-relative path.
+func stubBinaryPage(head, other binaryPage) binaryPage {
+	link, err := filepath.Rel(filepath.Dir(other.fname), head.fname)
+	if err != nil {
+		link = head.fname
+	}
+	return binaryPage{
+		rel:   other.rel,
+		fname: other.fname,
+		body: fmt.Sprintf("# %s\n\n> Same diff as [%s](%s) — this copy of the binary compared identically; the full page lives there.\n",
+			other.rel, head.rel, link),
+	}
 }
 
 // insertSameDiffNote inserts the "Same diff in" note between the page's

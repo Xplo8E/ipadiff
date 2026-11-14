@@ -734,3 +734,48 @@ func TestRenderBinaryFile_MetadataAndRawOnly(t *testing.T) {
 		}
 	}
 }
+
+func TestDedupeBinaryPages_MergesIdenticalBodies(t *testing.T) {
+	shared := "# Frameworks/Foo.framework/Foo\n\n## Mach-O Metadata\n\nsame\n"
+	pages := []binaryPage{
+		{rel: "Frameworks/Foo.framework/Foo", fname: "FRAMEWORKS/Foo.md", body: shared},
+		{rel: "PlugIns/Ext.appex/Ext", fname: "PLUGINS/Ext.md", body: shared},
+		{rel: "PlugIns/Ext.appex/Frameworks/Foo.framework/Foo", fname: "PLUGINS/Foo2.md", body: shared},
+		{rel: "Demo", fname: "app.md", body: "# Demo\n\n## Mach-O Metadata\n\ndifferent\n"},
+	}
+	out := dedupeBinaryPages(pages)
+	if len(out) != len(pages) {
+		t.Fatalf("every page must still exist (README links rely on it), got %d of %d", len(out), len(pages))
+	}
+	heads, stubs := 0, 0
+	for _, p := range out {
+		switch {
+		case strings.Contains(p.body, "Same diff in:"):
+			heads++
+			if !strings.Contains(p.body, "PlugIns/Ext.appex/Ext") || !strings.Contains(p.body, "PlugIns/Ext.appex/Frameworks/Foo.framework/Foo") {
+				t.Fatalf("head note missing the duplicate rels: %s", p.body)
+			}
+		case strings.Contains(p.body, "Same diff as"):
+			stubs++
+		}
+	}
+	if heads != 1 || stubs != 2 {
+		t.Fatalf("want 1 head + 2 stubs, got %d heads + %d stubs", heads, stubs)
+	}
+	for _, p := range out {
+		if p.rel == "PlugIns/Ext.appex/Ext" && !strings.Contains(p.body, "../FRAMEWORKS/Foo.md") {
+			t.Fatalf("stub link must resolve relative to the stub's own dir: %s", p.body)
+		}
+	}
+}
+
+func TestDedupeBinaryPages_NoDuplicatesPassesThrough(t *testing.T) {
+	pages := []binaryPage{
+		{rel: "a", fname: "app.md", body: "# a\n\none\n"},
+		{rel: "b", fname: "FRAMEWORKS/b.md", body: "# b\n\ntwo\n"},
+	}
+	out := dedupeBinaryPages(pages)
+	if len(out) != 2 || out[0].fname != "app.md" || strings.Contains(out[0].body, "Same diff") {
+		t.Fatalf("unique pages must pass through unchanged, got %#v", out)
+	}
+}

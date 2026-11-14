@@ -41,6 +41,11 @@ type Config struct {
 	// load commands, entitlements, launch constraints) as facts.json in the
 	// multi-file report directory. Streamed Markdown output ignores this.
 	Facts bool
+	// FactsFunctionStarts keeps the per-function start/end address arrays in
+	// facts.json. They dominate the file size (hundreds of thousands of
+	// entries per binary) and are off by default; the section content hashes
+	// and load-command digest already carry the change signal.
+	FactsFunctionStarts bool
 
 	AllowList []string // glob filter on Mach-O section names (Seg.Section)
 	BlockList []string
